@@ -1,0 +1,2533 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Hiyoko – a procedural chicken yard</title>
+
+<style>
+  /* ---------- Colors & page frame ---------- */
+  :root {
+    --bg: #14110d;
+    --ink: #fff7e6;
+    --dock: rgba(40, 28, 16, .8);
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #0d0b08; } }
+  :root[data-theme="dark"] { --bg: #0d0b08; }
+
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    font: 600 13px ui-rounded, "Trebuchet MS", system-ui, sans-serif;
+    color: var(--ink);
+  }
+
+  /* ---------- Game area (16:9) ---------- */
+  #w { position: relative; width: min(100vw, calc(100vh * 16 / 9)); aspect-ratio: 16 / 9; }
+  canvas { width: 100%; height: 100%; image-rendering: pixelated; display: block; touch-action: none; cursor: crosshair; }
+
+  /* ---------- UI panels (title, hint, bottom dock) ---------- */
+  .ui {
+    position: absolute;
+    background: var(--dock);
+    color: var(--ink);
+    backdrop-filter: blur(6px);
+    border-radius: 12px;
+    padding: 8px 12px;
+    display: flex; align-items: center; gap: 8px;
+    transition: opacity .4s;
+  }
+  #w.off .ui { opacity: 0; pointer-events: none; }        /* "Hide UI" button */
+  #tl   { left: 2%; top: 3%; font-weight: 800; letter-spacing: .12em; }
+  #hint { left: 50%; top: 3%; transform: translateX(-50%); }
+  #dock { left: 50%; bottom: 3%; transform: translateX(-50%); flex-direction: column; gap: 4px; width: max-content; max-width: 96%; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 10px; }
+  .ctr { display: flex; align-items: center; gap: 4px; }       /* one "− 6 + hens" group */
+
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 4px 6px; border-radius: 8px; cursor: pointer; }
+  button:hover { background: rgba(255, 255, 255, .12); }
+  button:focus-visible { outline: 2px solid #ffd23f; }
+  kbd { font: inherit; font-size: 10px; background: rgba(255, 255, 255, .15); border-radius: 5px; padding: 1px 5px; margin-left: 4px; }
+  .sep { width: 1px; height: 16px; background: rgba(255, 255, 255, .25); }
+
+  @media (max-width: 640px) {
+    kbd { display: none; }
+    #dock { padding: 6px 8px; font-size: 12px; }
+    .row { gap: 2px 6px; }
+    .sep { display: none; }
+  }
+</style>
+</head>
+
+<body>
+<div id="w">
+  <canvas id="c" aria-label="Interactive chicken yard: tap to scare the chickens"></canvas>
+  <div class="ui" id="tl">hiyoko</div>
+  <div class="ui" id="hint">Tap the yard to scare the flock. Tap a chicken to pet it, drag to carry it</div>
+  <div class="ui" id="dock">
+    <div class="row">
+      <span class="ctr"><button id="hen-less" aria-label="Fewer hens">−</button><b id="hen-count">6</b><button id="hen-more" aria-label="More hens">+</button><span>hens</span></span>
+      <span class="ctr"><button id="rooster-less" aria-label="Fewer roosters">−</button><b id="rooster-count">1</b><button id="rooster-more" aria-label="More roosters">+</button><span>roosters</span></span>
+      <span class="ctr"><button id="chick-less" aria-label="Fewer chicks">−</button><b id="chick-count">14</b><button id="chick-more" aria-label="More chicks">+</button><span>chicks</span></span>
+      <span class="ctr"><span>eggs</span><b id="egg-count">0</b></span>
+    </div>
+    <div class="row">
+      <button id="sc">Scatter<kbd>Space</kbd></button>
+      <button id="fd">Feed<kbd>F</kbd></button>
+      <button id="hk">Hawk<kbd>K</kbd></button>
+      <i class="sep"></i>
+      <button id="rn">Sunny</button>
+      <button id="tm">Time: Auto</button>
+      <button id="snd">Sound: On</button>
+      <i class="sep"></i>
+      <button id="ps">Pause<kbd>P</kbd></button>
+      <button id="cam">Photo<kbd>C</kbd></button>
+      <button id="hd">Hide UI<kbd>H</kbd></button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ==========================================================================
+   1. SETTINGS  –  the easy-to-tweak numbers. Change these first!
+   (speeds are in pixels per second on a 480 x 270 canvas)
+   ========================================================================== */
+const SETTINGS = {
+
+  // ----- Flock size -----
+  startingHens:     6,
+  startingRoosters: 1,
+  startingChicks:   14,
+  maxHens:          20,
+  maxRoosters:      10,
+  maxChicks:        40,
+
+  // ----- Roosters -----
+  roosterSize:     [1.25, 1.4],   // hens are about 0.9 - 1.15, so roosters look bigger
+  crowEvery:       [12, 28],      // seconds between crows (random in this range)
+  crowDuration:    1.6,           // seconds a crow lasts
+
+  // ----- Normal walking speed (each bird picks a random value in its range) -----
+  henSpeedRange:   [15, 23],
+  chickSpeedRange: [30, 38],
+
+  // ----- Scared sprint (after a tap / Scatter) -----
+  scaredRunMultiplier:  3.6,   // run speed = walking speed x this
+  scaredRunBoost:       2.5,   // instant kick of speed (x walking speed) at the moment they bolt
+  scaredFleeTime:       1.3,   // seconds they keep pushing away from the tap point
+  scaredPanicTime:      1.6,   // seconds they keep running + flapping after bolting
+
+  // ----- Wing flapping (hens only). Wings flap ONLY after a tap on the yard. -----
+  //       Normal walking / running / running to food keeps the wings folded.
+  wingFlapRate:    30,         // flaps speed (radians/sec, 30 is about 5 flaps per second)
+  wingFlapOpen:    0.6,        // how far wings are held open on average
+  wingFlapSwing:   0.55,       // how far wings move up/down while flapping
+  henHopHeight:    2,          // little hop in pixels while flapping (0 = no hop)
+
+  // ----- Tap on screen -----
+  tapScareRadius:    150,      // chickens closer than this to the tap get scared
+  tapReactionSpeed:  300,      // reaction delay = distance / this (farther birds react later)
+
+  // ----- Heading to a worm or food pellet (a little faster than a normal walk) -----
+  chaseWalkMultiplier: 1.7,    // close to the food: brisk walk  = walking speed x this
+  chaseRunMultiplier:  2.4,    // far from the food: quick run   = walking speed x this
+  chaseRunDistance:    45,     // farther than this many pixels -> run, closer -> brisk walk
+  wormSightRange:      150,    // how far a bird can spot a worm
+  pelletSightRange:    220,    // how far a bird can spot a food pellet
+  wormDistancePenalty: 1.5,    // worms "feel" this much farther away (birds prefer pellets)
+  eatReach:            5,      // how close (px) the bird needs to be to start pecking
+  peckTime:            0.8,    // seconds spent pecking one worm/pellet
+
+  // ----- Worms -----
+  wormCount:        8,         // worms kept alive in the yard
+  wormGrowTime:     2.5,       // seconds for a worm to crawl out of its hole
+  wormCrawlSpeed:   4,         // normal crawl speed
+  wormFleeSpeed:    11,        // crawl speed when a bird is close
+
+  // ----- Feed button -----
+  pelletsPerFeed:   26,
+
+  // ----- Eggs and growing up -----
+  eggsEnabled:     true,
+  layEvery:        [45, 100],  // each hen lays an egg about this often (seconds)
+  layTime:         5,          // seconds a hen sits on the nest
+  hatchTime:       [28, 40],   // seconds until an egg hatches
+  maxEggs:         5,          // the nest tray holds this many
+  growUpTime:      [90, 150],  // seconds for a hatched chick to grow up
+  roosterChance:   0.3,        // chance a grown-up chick becomes a rooster (otherwise a hen)
+  maxBirds:        70,         // no more eggs / hatching above this many birds
+
+  // ----- Water, feeder and dust bath -----
+  thirstEvery:     [60, 120],  // seconds until a bird wants a drink
+  hungerEvery:     [70, 130],  // seconds until a bird wants to visit the feeder
+  drinkTime:       2.6,
+  feederTime:      3,
+  dustEvery:       [50, 110],  // seconds between dust baths
+  dustTime:        4,
+
+  // ----- Rooster personality -----
+  rivalEvery:      [25, 50],   // seconds between rooster fights (needs 2+ roosters)
+  fightTime:       3,          // seconds one rooster chases the other
+  guardRadius:     70,         // roosters stay within this distance of the hens
+
+  // ----- Day and night -----
+  dayLength:       240,        // seconds for one whole day + night
+  startTime:       0.35,       // 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset
+  nightTint:       0.55,       // how dark the night is (0 - 1)
+
+  // ----- Hawk (press the Hawk button / K) -----
+  hawkSpeed:       120,
+  hawkScareRadius: 80,         // chickens this close to the hawk's shadow bolt and flap
+
+  // ----- Rain & lightning -----
+  thunderShockRadius: 80,      // birds this close to a lightning strike get paralyzed
+  thunderScareRadius: 170,     // birds this close (but outside shock radius) run away
+};
+
+
+/* ==========================================================================
+   2. SMALL HELPER FUNCTIONS
+   ========================================================================== */
+const WIDTH = 480, HEIGHT = 270;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const byId = id => document.getElementById(id);
+
+canvas.width = WIDTH;
+canvas.height = HEIGHT;
+ctx.imageSmoothingEnabled = false;
+
+// Seeded random generator (same seed = same yard every time).
+const makeRandom = seed => () => {
+  seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+};
+const staticRandom = makeRandom(7);    // used only for the one-time ground painting
+const liveRandom   = makeRandom(42);   // used while the game is running
+
+// Steady "random" number for a pixel position (same input = same output, so the art never changes)
+const noise = (x, y) => ((x * 73856093) ^ (y * 19349663)) >>> 0;
+
+const pickFrom = (random, list) => list[random() * list.length | 0];
+const clamp    = (v, min, max) => Math.max(min, Math.min(max, v));
+const between  = (range) => range[0] + liveRandom() * (range[1] - range[0]);
+
+// Keep an angle inside -PI .. +PI
+const wrapAngle = a => {
+  while (a >  Math.PI) a -= 6.2832;
+  while (a < -Math.PI) a += 6.2832;
+  return a;
+};
+
+// Create an off-screen canvas the same size as the game. Returns [canvas, context].
+const makeLayer = () => {
+  const c = document.createElement('canvas');
+  c.width = WIDTH; c.height = HEIGHT;
+  return [c, c.getContext('2d')];
+};
+
+// Draw a filled pixel-art circle (no anti-aliasing).
+const drawDisc = (c, x, y, radius, color) => {
+  c.fillStyle = color;
+  x = Math.round(x); y = Math.round(y);
+  const n = Math.ceil(radius);
+  for (let j = -n; j <= n; j++) {
+    if (j * j > radius * radius) continue;
+    const halfWidth = Math.floor(Math.sqrt(radius * radius - j * j));
+    c.fillRect(x - halfWidth, y + j, 2 * halfWidth + 1, 1);
+  }
+};
+
+// Make a tiny canvas and let `paint` draw on it (used for the chicken body parts).
+const makeSprite = (w, h, paint) => {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  paint(c.getContext('2d'));
+  return c;
+};
+
+
+/* ==========================================================================
+   2b. SOUND  –  little sounds made with the browser's audio (no files to load)
+   Sound starts after your first tap/click (browsers require that) and can be muted with the Sound button.
+   ========================================================================== */
+const Sound = (() => {
+  let ac = null, master = null, noiseBuffer = null, on = true;
+  const last = {};                                   // when each sound last played (so they never pile up)
+  const gate = (name, gap) => {                      // returns false if this sound played too recently
+    if (!ac) return false;
+    if (ac.currentTime - (last[name] || -9) < gap) return false;
+    last[name] = ac.currentTime;
+    return true;
+  };
+
+  // A simple beep that can slide from one pitch to another
+  function tone(freq, dur, o = {}) {
+    const t = ac.currentTime + (o.delay || 0);
+    const osc = ac.createOscillator(), gain = ac.createGain();
+    osc.type = o.type || 'sine';
+    osc.frequency.setValueAtTime(freq, t);
+    if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + dur);
+    gain.gain.setValueAtTime(.0001, t);
+    gain.gain.exponentialRampToValueAtTime(o.vol ?? .1, t + Math.min(.02, dur / 3));
+    gain.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    let out = osc;
+    if (o.lowpass) { const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = o.lowpass; osc.connect(f); out = f; }
+    out.connect(gain); gain.connect(master);
+    if (o.vibrato) {                                  // wobbling pitch (used for the long crow)
+      const lfo = ac.createOscillator(), lfoGain = ac.createGain();
+      lfo.frequency.value = o.vibrato; lfoGain.gain.value = freq * .035;
+      lfo.connect(lfoGain); lfoGain.connect(osc.frequency); lfo.start(t); lfo.stop(t + dur + .05);
+    }
+    osc.start(t); osc.stop(t + dur + .05);
+  }
+
+  // A burst of noise (wind, thunder, pecks)
+  function noise(dur, o = {}) {
+    if (!noiseBuffer) {
+      noiseBuffer = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+      const data = noiseBuffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    }
+    const t = ac.currentTime + (o.delay || 0);
+    const src = ac.createBufferSource(), filter = ac.createBiquadFilter(), gain = ac.createGain();
+    src.buffer = noiseBuffer;
+    filter.type = o.filter || 'bandpass';
+    filter.frequency.setValueAtTime(o.freq || 1000, t);
+    if (o.sweepTo) filter.frequency.exponentialRampToValueAtTime(o.sweepTo, t + dur);
+    gain.gain.setValueAtTime(.0001, t);
+    gain.gain.exponentialRampToValueAtTime(o.vol ?? .1, t + Math.min(.03, dur / 3));
+    gain.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    src.connect(filter); filter.connect(gain); gain.connect(master);
+    src.start(t, Math.random()); src.stop(t + dur + .05);
+  }
+
+  return {
+    // call this from a tap / key press (browsers only allow sound after that)
+    unlock() {
+      if (!ac) {
+        const AC = globalThis.AudioContext || globalThis.webkitAudioContext;
+        if (!AC) return;
+        try { ac = new AC(); master = ac.createGain(); master.gain.value = .5; master.connect(ac.destination); } catch (e) { ac = null; }
+      }
+      if (ac && ac.state === 'suspended') ac.resume();
+    },
+    get isOn() { return on; },
+    setOn(value) { on = value; },
+    toggle() { on = !on; return on; },
+
+    // ---- the sounds (each one checks that sound is on and unlocked) ----
+    crow() {                                          // cock-a-doodle-doo
+      if (!on || !gate('crow', 1.2)) return;
+      const p = .9 + Math.random() * .25, o = { type: 'sawtooth', vol: .06, lowpass: 2400 };
+      tone(520 * p, .16, { ...o, to: 700 * p });
+      tone(680 * p, .12, { ...o, to: 560 * p, delay: .17 });
+      tone(640 * p, .2,  { ...o, to: 900 * p, delay: .3 });
+      tone(900 * p, .6,  { ...o, to: 620 * p, delay: .52, vibrato: 9 });
+    },
+    cluck() {
+      if (!on || !gate('cluck', .45)) return;
+      const f = 240 + Math.random() * 70;
+      tone(f, .06, { type: 'square', to: f * .65, vol: .03, lowpass: 900 });
+      tone(f * 1.1, .05, { type: 'square', to: f * .7, vol: .025, lowpass: 900, delay: .09 });
+    },
+    peck() { if (on && gate('peck', .09)) noise(.025, { freq: 1800, vol: .05 }); },
+    drink() { if (on && gate('drink', .25)) tone(500 + Math.random() * 200, .05, { to: 900, vol: .03 }); },
+    pip()   { if (on && gate('pip', .1)) { tone(880, .08, { vol: .07 }); tone(1320, .1, { vol: .07, delay: .08 }); } },        // egg laid
+    peep()  { if (on && gate('peep', .1)) { tone(1500, .07, { to: 2100, vol: .05 }); tone(1700, .07, { to: 2300, vol: .05, delay: .1 }); } },
+    squeak(){ if (on && gate('squeak', .12)) tone(1200, .08, { to: 1750, vol: .06 }); },
+    whoosh(){ if (on && gate('whoosh', .2)) noise(.25, { freq: 900, sweepTo: 2500, vol: .07 }); },
+    click() { if (on && gate('click', .1)) noise(.03, { freq: 3000, vol: .12 }); },
+    thunder() {
+      if (!on || !gate('thunder', .5)) return;
+      noise(.14, { freq: 2500, vol: .22 });
+      noise(1.8, { filter: 'lowpass', freq: 500, sweepTo: 90, vol: .55, delay: .05 });
+    },
+    screech() {
+      if (!on || !gate('screech', 1)) return;
+      tone(2300, .55, { type: 'sawtooth', to: 1400, vol: .04, lowpass: 3600 });
+      tone(2000, .4, { type: 'sawtooth', to: 1300, vol: .035, lowpass: 3600, delay: .3 });
+    },
+  };
+})();
+
+
+/* ==========================================================================
+   3. THE YARD  –  ground, bushes, sunflowers, fences, coop (painted ONCE)
+   ========================================================================== */
+
+// Layers:  ground = under everything,  birdShadow = redrawn each frame,
+//          canopy = drawn OVER the birds (bush tops, coop),  staticShadow = temporary
+const [groundCanvas,       ground]       = makeLayer();
+const [birdShadowCanvas,   birdShadow]   = makeLayer();
+const [canopyCanvas,       canopy]       = makeLayer();
+const [staticShadowCanvas, staticShadow] = makeLayer();
+
+// ---------- Colors used by the ground ----------
+const DIRT_SHADES  = ['#97703f', '#a3794a', '#b08354', '#bc9060', '#c79b6a'];     // dark ... light packed dirt
+const GRASS_SHADES = ['#5f9440', '#6fa24b', '#7bae52', '#86b85c', '#93c565'];     // dark ... light grass
+const STRAW_COLORS = ['#e3c35c', '#f1da7e', '#c9a53f', '#d9b64a'];
+const RUT_DEEP = '#7a5532', RUT_MID = '#8e6740', RUT_LIT = '#d6b080';
+
+// Ground settings you can tweak
+const GROUND = {
+  grassThreshold: .6,          // higher = less grass (0.5 lots of grass ... 0.8 almost none)
+  grassEdgeAmount: .72,        // how much extra grass grows around the outside of the yard
+  rutPath: [[-12, 214], [110, 244], [250, 158], [392, 196]],   // wheel ruts: 4 curve points [x, y] (left edge -> coop)
+  rutSpacing: 5.5,             // distance from the middle of the track to each wheel groove
+  pebbleCount: 70,
+  tuftCount: 260,
+  flowerCount: 34,
+  strawScattered: 220,         // loose straw pieces spread over the dirt
+  strawClumps: [[90, 190], [170, 90], [300, 200], [330, 110], [210, 60], [60, 120], [402, 180]],   // piles of straw: [x, y]
+};
+
+// --- 3a. Soft noise: makes natural-looking blotches instead of random static ---
+const NOISE_SIZE = 64;
+const makeNoiseGrid = () => Float32Array.from({ length: NOISE_SIZE * NOISE_SIZE }, () => staticRandom());
+const dirtNoise = makeNoiseGrid(), grassNoise = makeNoiseGrid(), islandNoise = makeNoiseGrid();
+const smoothStep = t => t * t * (3 - 2 * t);
+function valueNoise(grid, x, y, scale) {
+  const gx = x / scale, gy = y / scale, ix = Math.floor(gx), iy = Math.floor(gy);
+  const fx = smoothStep(gx - ix), fy = smoothStep(gy - iy);
+  const at = (i, j) => grid[(j & 63) * NOISE_SIZE + (i & 63)];
+  const top    = at(ix, iy)     + (at(ix + 1, iy)     - at(ix, iy))     * fx;
+  const bottom = at(ix, iy + 1) + (at(ix + 1, iy + 1) - at(ix, iy + 1)) * fx;
+  return top + (bottom - top) * fy;
+}
+const layeredNoise = (grid, x, y, scale) =>        // big blotches + medium + fine detail
+  valueNoise(grid, x, y, scale) * .6 + valueNoise(grid, x + 31, y + 17, scale / 2.1) * .3 + valueNoise(grid, x + 77, y + 53, scale / 4.3) * .1;
+
+// How "grassy" is a spot? (grass grows around the edges of the yard and in a few islands)
+function grassValue(x, y) {
+  const rx = (x - 240) / 230, ry = (y - 140) / 118, r = Math.sqrt(rx * rx + ry * ry);
+  const edge = clamp((r - .78) / .5, 0, 1);
+  const base = layeredNoise(grassNoise, x, y, 38) * .6 + edge * GROUND.grassEdgeAmount;
+  const island = layeredNoise(islandNoise, x + 200, y + 90, 22);
+  return Math.max(base, (island - .6) * 3 + .5);
+}
+
+// --- 3b. Paint every pixel: packed farmyard dirt, with grass patches ---
+const isGrassPixel = new Uint8Array(WIDTH * HEIGHT);
+for (let y = 0; y < HEIGHT; y++) {
+  for (let x = 0; x < WIDTH; x++) {
+    if (grassValue(x, y) + (staticRandom() - .5) * .07 > GROUND.grassThreshold) {
+      isGrassPixel[y * WIDTH + x] = 1;
+      const g = layeredNoise(grassNoise, x + 9, y + 9, 9);
+      ground.fillStyle = GRASS_SHADES[clamp(Math.floor((g - .25) * 8 + (staticRandom() - .5) * 1.6), 0, 4)];
+    } else {
+      const d = layeredNoise(dirtNoise, x, y, 30);
+      ground.fillStyle = DIRT_SHADES[clamp(Math.floor((d - .2) * 7.5 + (staticRandom() - .5) * 1.6), 0, 4)];
+    }
+    ground.fillRect(x, y, 1, 1);
+  }
+}
+// specks of dark soil and light dust on the dirt
+for (let i = 0; i < 2600; i++) {
+  const x = staticRandom() * WIDTH | 0, y = staticRandom() * HEIGHT | 0;
+  if (isGrassPixel[y * WIDTH + x]) continue;
+  ground.fillStyle = i % 3 ? '#85602f' : '#d6b07a';
+  ground.fillRect(x, y, 1 + (staticRandom() * 2 | 0), 1);
+}
+
+// Find a random spot on dirt (or on grass if onGrass is true)
+function randomSpot(onGrass) {
+  for (let tries = 0; tries < 60; tries++) {
+    const x = 8 + staticRandom() * (WIDTH - 16) | 0, y = 8 + staticRandom() * (HEIGHT - 16) | 0;
+    if (!!isGrassPixel[y * WIDTH + x] === onGrass) return [x, y];
+  }
+  return [WIDTH / 2, HEIGHT / 2];
+}
+
+// --- 3c. Wheel ruts: two grooves from the left edge toward the coop, with trampled dirt between ---
+const rutCurve = t => {
+  const [p0, p1, p2, p3] = GROUND.rutPath, u = 1 - t;
+  const f = i => u * u * u * p0[i] + 3 * u * u * t * p1[i] + 3 * u * t * t * p2[i] + t * t * t * p3[i];
+  return [f(0), f(1)];
+};
+const LIGHT = [-.6, -.8];                          // sunlight comes from the top-left
+for (let t = 0; t <= 1; t += .0012) {
+  const [cx, cy] = rutCurve(t), [nx2, ny2] = rutCurve(t + .003);
+  let tx = nx2 - cx, ty = ny2 - cy; const len = Math.hypot(tx, ty) || 1; tx /= len; ty /= len;
+  const nx = -ty, ny = tx;                         // sideways direction
+  const put = (offset, color, skipChance) => {
+    const x = Math.round(cx + nx * offset), y = Math.round(cy + ny * offset);
+    if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT) return;
+    if (skipChance && noise(x, y) % skipChance === 0) return;
+    isGrassPixel[y * WIDTH + x] = 0;
+    ground.fillStyle = color; ground.fillRect(x, y, 1, 1);
+  };
+  for (let k = -9; k <= 9; k++) {                  // trampled strip: turn grass into dirt
+    const x = Math.round(cx + nx * k), y = Math.round(cy + ny * k);
+    if (x >= 0 && y >= 0 && x < WIDTH && y < HEIGHT && isGrassPixel[y * WIDTH + x]) put(k, DIRT_SHADES[1 + noise(x, y) % 2], 0);
+  }
+  for (const side of [-1, 1]) {                    // the two wheel grooves
+    const mid = side * GROUND.rutSpacing;
+    put(mid, RUT_DEEP, 7);
+    put(mid - 1, RUT_MID, 5); put(mid + 1, RUT_MID, 5);
+    const outerLit = (nx * side) * LIGHT[0] + (ny * side) * LIGHT[1] > 0;     // is the outer bank facing the sun?
+    const innerLit = -(nx * side) * LIGHT[0] - (ny * side) * LIGHT[1] > 0;
+    put(mid + side * 2, outerLit ? RUT_LIT : RUT_MID, 4);
+    put(mid - side * 2, innerLit ? RUT_LIT : RUT_MID, 4);
+  }
+}
+
+// --- 3d. Pebbles (on the dirt) ---
+for (let i = 0; i < GROUND.pebbleCount; i++) {
+  const [x, y] = randomSpot(false);
+  ground.fillStyle = 'rgba(60,40,20,.35)'; ground.fillRect(x + 1, y + 1, 2, 1);        // tiny shadow
+  ground.fillStyle = i % 2 ? '#a89a86' : '#8d8070'; ground.fillRect(x, y, 2, 1);
+  if (i % 3 === 0) { ground.fillStyle = '#c9bdaa'; ground.fillRect(x, y, 1, 1); }
+}
+
+// --- 3e. Grass tufts (on the grass) ---
+for (let i = 0; i < GROUND.tuftCount; i++) {
+  const [x, y] = randomSpot(true);
+  ground.fillStyle = i % 4 ? '#4f8535' : '#3f7230';
+  ground.fillRect(x, y, 1, 2);
+  ground.fillRect(x + 2, y + 1, 1, 2);
+  ground.fillRect(x - 2, y + 1, 1, 1);
+}
+
+// --- 3f. Tiny flowers (on the grass) ---
+for (let i = 0; i < GROUND.flowerCount; i++) {
+  const [x, y] = randomSpot(true);
+  ground.fillStyle = i % 5 ? '#fff' : '#ffe27a';
+  ground.fillRect(x, y - 1, 1, 3);
+  ground.fillRect(x - 1, y, 3, 1);
+  ground.fillStyle = i % 5 ? '#ffd23f' : '#fff';
+  ground.fillRect(x, y, 1, 1);
+}
+
+// --- 3g. Straw: loose pieces + a few piles ---
+function strawPiece(x, y) {
+  const angle = staticRandom() * 3.14, length = 3 + staticRandom() * 4;
+  drawPixelLine(ground, { x, y }, { x: x + Math.cos(angle) * length, y: y + Math.sin(angle) * length }, pickFrom(staticRandom, STRAW_COLORS));
+}
+for (let i = 0; i < GROUND.strawScattered; i++) { const [x, y] = randomSpot(false); strawPiece(x, y); }
+for (const [cx, cy] of GROUND.strawClumps) {
+  for (let i = 0; i < 28; i++) {
+    const a = staticRandom() * 6.28, r = Math.sqrt(staticRandom()) * 13;
+    strawPiece(cx + Math.cos(a) * r, cy + Math.sin(a) * r * .7);
+  }
+}
+
+// --- 3h. Bushes in the corners: [x, y, size] ---
+const bushes = [[18, 28, 40], [458, 22, 36], [26, 252, 42], [444, 256, 44], [240, -8, 30], [300, 282, 26]]
+  .map(([x, y, size]) => ({
+    x, y, size,
+    // each bush is 8 overlapping leaf blobs: [offsetX, offsetY, radius]
+    puffs: Array.from({ length: 8 }, () => [
+      (staticRandom() - .5) * size * 1.1,
+      (staticRandom() - .5) * size * 1.1,
+      size * (.4 + staticRandom() * .25),
+    ]),
+  }));
+
+// --- 3i. Sunflower positions + OBSTACLES chickens must walk around: [x, y, radius] ---
+//        (circles; if you move the coop, move its circles too)
+const sunflowerSpots = [[110, 210], [330, 232], [150, 48], [300, 30]];
+const OBSTACLES = [
+  [406, 134, 22], [426, 134, 22],                         // the coop roof (2 big circles)
+  [451, 136, 11],                                           // the nest box
+  ...sunflowerSpots.map(([x, y]) => [x, y, 15]),            // the sunflowers
+];
+
+// Paint bushes (dark shadow underneath, then light green layers on top)
+bushes.forEach(b => {
+  for (const [dx, dy, r] of b.puffs) {
+    drawDisc(staticShadow, b.x + dx + 6, b.y + dy + 7, r, '#14301c');
+    drawDisc(canopy,       b.x + dx,     b.y + dy,     r, '#1f5a30');
+  }
+  for (const [dx, dy, r] of b.puffs) {
+    drawDisc(canopy, b.x + dx - r * .12, b.y + dy - r * .15, r * .72, '#2c7a3e');
+    drawDisc(canopy, b.x + dx - r * .25, b.y + dy - r * .3,  r * .35, '#4a9d52');
+  }
+});
+
+// Paint sunflowers
+sunflowerSpots.forEach(([x, y]) => {
+  drawDisc(staticShadow, x + 5, y + 6, 13, '#14301c');
+  drawDisc(canopy, x,     y,     12.5, '#9c7120');
+  drawDisc(canopy, x - 1, y - 1, 11,   '#c99a35');
+  drawDisc(canopy, x - 2, y - 2, 8.5,  '#e2bb55');
+  for (let i = 0; i < 46; i++) {                              // seeds
+    const angle = staticRandom() * 6.283, dist = staticRandom() * 10.5;
+    canopy.fillStyle = i % 3 ? '#f2d97c' : '#a87a22';
+    canopy.fillRect(Math.round(x + Math.cos(angle) * dist - 2), Math.round(y + Math.sin(angle) * dist - 2), 3, 1);
+  }
+  drawDisc(canopy, x - 3, y - 3, 2, '#f7e7a0');               // highlight
+});
+
+// Coop shadow (falls to the bottom-right), then bake all shadows into the ground at 32% opacity
+staticShadow.fillStyle = '#14301c';
+staticShadow.fillRect(390, 119, 60, 44);      // roof
+staticShadow.fillRect(450, 131, 14, 24);      // nest box
+ground.globalAlpha = .32;
+ground.drawImage(staticShadowCanvas, 0, 0);
+ground.globalAlpha = 1;
+
+// --- 3j. Wooden fences around the yard ---
+const drawHorizontalFence = (x1, x2, y) => {
+  ground.fillStyle = 'rgba(20,50,20,.3)'; ground.fillRect(x1 + 1, y + 3, x2 - x1, 3);   // shadow
+  ground.fillStyle = '#b88f58';           ground.fillRect(x1, y, x2 - x1, 3);           // rail
+  ground.fillStyle = '#e0bf88';           ground.fillRect(x1, y, x2 - x1, 1);           // rail highlight
+  for (let x = x1; x <= x2; x += 20) {                                                   // posts
+    ground.fillStyle = '#6a4724'; ground.fillRect(x - 1, y - 2, 4, 6);
+    ground.fillStyle = '#9c7646'; ground.fillRect(x - 1, y - 2, 4, 2);
+  }
+};
+const drawVerticalFence = (x, y1, y2) => {
+  ground.fillStyle = 'rgba(20,50,20,.3)'; ground.fillRect(x + 3, y1 + 1, 3, y2 - y1);
+  ground.fillStyle = '#b88f58';           ground.fillRect(x, y1, 3, y2 - y1);
+  ground.fillStyle = '#e0bf88';           ground.fillRect(x, y1, 1, y2 - y1);
+  for (let y = y1; y <= y2; y += 20) {
+    ground.fillStyle = '#6a4724'; ground.fillRect(x - 2, y - 1, 6, 4);
+    ground.fillStyle = '#9c7646'; ground.fillRect(x - 2, y - 1, 2, 4);
+  }
+};
+drawHorizontalFence(4, WIDTH - 5, 4);              // top
+drawHorizontalFence(4, WIDTH - 5, HEIGHT - 9);     // bottom
+drawVerticalFence(4, 4, HEIGHT - 8);               // left
+drawVerticalFence(WIDTH - 8, 4, HEIGHT - 8);       // right
+
+// --- 3k. THE COOP (plain wooden chicken house, seen from ABOVE) ---
+// Roof runs left-right with the ridge in the middle. Ramp on the south side, nest box on the east side.
+// All coop colors live here so you can recolor it easily.
+const COOP = {
+  // roof shingles: the north slope faces the light (lighter), the south slope is in shade (darker)
+  shinglesLit:   ['#9a7549', '#8d6b41', '#a58353'],
+  shinglesShade: ['#78582f', '#6b4d2b', '#80613a'],
+  shingleGapLit: '#5e4326',  shingleGapShade: '#46301a',
+  ridge: '#b88f5c', ridgeLight: '#d3ae7b', ridgeDark: '#8a6538',     // board along the top of the roof
+  edgeDark: '#3f2b17', edgeLight: '#b08c5a', edgeMid: '#5f4427',     // outline of the roof boards
+  plank: '#b58a56', plankLight: '#cfa66e', plankDark: '#7a5630',     // plain wood (ramp, nest box)
+  nail: '#33241a', metal: '#8d9094', metalLight: '#c4c7ca',
+  dirtWorn: '#a47d47',                                               // worn dirt at the bottom of the ramp
+};
+const rect = (c, x, y, w, h, color) => { c.fillStyle = color; c.fillRect(x, y, w, h); };
+
+// Where the coop sits. Change these to move / resize the roof (then move the OBSTACLES circles too).
+const ROOF = { x: 384, y: 112, w: 60, h: 44 };                          // roof rectangle
+const RIDGE_Y = ROOF.y + 21;                                            // top of the ridge board (3px tall)
+
+// ----- 3k-1. Things ON THE GROUND (chickens can walk over these) -----
+
+// Worn dirt where chickens walk up to the ramp
+for (let y = 168; y < 184; y++) for (let x = 386; x < 420; x++) {
+  const dx = (x - 402) / 15, dy = (y - 174) / 8;
+  if (dx * dx + dy * dy < 1 && noise(x, y) % 3 === 0) rect(ground, x, y, 1, 1, COOP.dirtWorn);
+}
+
+// Ramp: it starts under the roof edge and slopes down to the grass
+rect(ground, 396, 148, 13, 26, COOP.plankDark);                          // side rails (outer)
+rect(ground, 397, 148, 11, 25, COOP.plank);                              // planks
+rect(ground, 402, 148, 1, 25, COOP.plankDark);                           // gap between two planks
+rect(ground, 397, 148, 1, 25, COOP.plankLight);                          // plank highlight
+for (let y = 158; y < 173; y += 3) rect(ground, 397, y, 11, 1, COOP.plankDark);   // grip cleats
+rect(ground, 396, 173, 13, 1, COOP.edgeDark);                            // bottom end of the ramp
+rect(ground, 398, 174, 12, 2, 'rgba(20,50,20,.28)');                     // ramp shadow
+
+// ----- 3k-2. The coop itself (drawn on the canopy layer, in front of the chickens) -----
+
+// Roof: wooden shingles in staggered rows. North half = lit, south half = shade.
+const drawShingles = (y0, y1, palette, gapColor) => {
+  for (let y = y0; y < y1; y++) {
+    const row = Math.floor((y - y0) / 4), inRow = (y - y0) % 4, offset = (row % 2) * 4;
+    for (let x = ROOF.x; x < ROOF.x + ROOF.w; x++) {
+      const col = Math.floor((x - ROOF.x + offset) / 8), seam = (x - ROOF.x + offset) % 8 === 0;
+      let color = palette[noise(col, row + y0) % 3];
+      if (noise(x, y) % 11 === 0) color = palette[(noise(col, row + y0) + 1) % 3];   // wood grain speckle
+      if (inRow === 3 || (seam && inRow < 3)) color = gapColor;                     // gaps between shingles
+      rect(canopy, x, y, 1, 1, color);
+    }
+  }
+};
+drawShingles(ROOF.y, RIDGE_Y, COOP.shinglesLit, COOP.shingleGapLit);                // north slope
+drawShingles(RIDGE_Y + 3, ROOF.y + ROOF.h, COOP.shinglesShade, COOP.shingleGapShade); // south slope
+
+// Ridge board along the top of the roof, with nail heads
+rect(canopy, ROOF.x, RIDGE_Y, ROOF.w, 3, COOP.ridge);
+rect(canopy, ROOF.x, RIDGE_Y, ROOF.w, 1, COOP.ridgeLight);
+rect(canopy, ROOF.x, RIDGE_Y + 2, ROOF.w, 1, COOP.ridgeDark);
+for (let x = ROOF.x + 4; x < ROOF.x + ROOF.w; x += 8) rect(canopy, x, RIDGE_Y + 1, 1, 1, COOP.nail);
+
+// Edge boards around the roof (light on top/left where the sun hits, dark on bottom/right)
+rect(canopy, ROOF.x - 1, ROOF.y - 1, ROOF.w + 2, 1, COOP.edgeDark);                  // top outline
+rect(canopy, ROOF.x - 1, ROOF.y,     ROOF.w + 2, 1, COOP.edgeLight);                 // top board (lit)
+rect(canopy, ROOF.x - 1, ROOF.y,     1, ROOF.h + 1, COOP.edgeDark);                  // left outline
+rect(canopy, ROOF.x,     ROOF.y,     1, ROOF.h, COOP.edgeLight);                     // left board (lit)
+rect(canopy, ROOF.x + ROOF.w - 1, ROOF.y, 1, ROOF.h, COOP.edgeMid);                  // right board (shade)
+rect(canopy, ROOF.x + ROOF.w,     ROOF.y, 1, ROOF.h + 1, COOP.edgeDark);             // right outline
+rect(canopy, ROOF.x, ROOF.y + ROOF.h - 2, ROOF.w, 2, COOP.edgeMid);                  // bottom board (shade)
+rect(canopy, ROOF.x - 1, ROOF.y + ROOF.h, ROOF.w + 2, 1, COOP.edgeDark);             // bottom outline
+
+// Dark gap under the south edge where the ramp goes into the hen door
+rect(canopy, 396, ROOF.y + ROOF.h, 13, 1, '#1d130a');
+rect(canopy, 397, ROOF.y + ROOF.h + 1, 11, 1, 'rgba(29,19,10,.55)');
+
+// Nest box on the east side: hinged lid, handle, plank lines
+const NEST = { x: ROOF.x + ROOF.w, y: 124, w: 14, h: 24 };
+rect(canopy, NEST.x, NEST.y, NEST.w, NEST.h, COOP.plank);
+for (let y = NEST.y + 4; y < NEST.y + NEST.h; y += 5) rect(canopy, NEST.x, y, NEST.w, 1, COOP.plankDark);   // lid boards
+rect(canopy, NEST.x, NEST.y, NEST.w, 1, COOP.plankLight);                                                 // lit top edge
+rect(canopy, NEST.x + NEST.w - 1, NEST.y, 1, NEST.h, COOP.plankDark);                                     // shaded right edge
+rect(canopy, NEST.x, NEST.y + NEST.h - 1, NEST.w, 1, COOP.plankDark);
+rect(canopy, NEST.x - 1 + NEST.w, NEST.y - 1, 1, NEST.h + 2, COOP.edgeDark);                              // outline
+rect(canopy, NEST.x, NEST.y - 1, NEST.w, 1, COOP.edgeDark);
+rect(canopy, NEST.x, NEST.y + NEST.h, NEST.w, 1, COOP.edgeDark);
+for (const hy of [NEST.y + 3, NEST.y + NEST.h - 6]) {                    // two metal hinges on the coop side
+  rect(canopy, NEST.x + 1, hy, 4, 3, COOP.metal);
+  rect(canopy, NEST.x + 1, hy, 4, 1, COOP.metalLight);
+  rect(canopy, NEST.x + 3, hy + 1, 1, 1, COOP.nail);
+}
+rect(canopy, NEST.x + 10, NEST.y + 10, 2, 4, COOP.metal);               // lid handle
+rect(canopy, NEST.x + 10, NEST.y + 10, 2, 1, COOP.metalLight);
+
+
+// --- 3l. YARD STATIONS: nest tray (eggs), water trough, feeder, dust bowl ---
+// Chickens walk to these on their own. Move them by changing the numbers here.
+
+// Nest tray: sits under the nest box. Eggs appear in these 5 slots: [x, y]
+const NEST_SPOT = { x: 452, y: 169, face: -Math.PI / 2 };          // where a hen stands to lay (she faces north)
+const EGG_SLOTS = [[448, 153], [452, 153], [456, 153], [450, 156], [454, 156]];
+rect(ground, 446, 150, 15, 9, 'rgba(20,50,20,.3)');                 // shadow
+rect(ground, 445, 148, 15, 10, COOP.plankDark);                      // wooden tray
+rect(ground, 446, 149, 13, 8, '#d9b64a');                            // straw bed
+for (let i = 0; i < 26; i++) {                                       // straw strands
+  const sx = 446 + noise(i, 3) % 13, sy = 149 + noise(i, 9) % 8;
+  rect(ground, sx, sy, 2, 1, i % 2 ? '#f1da7e' : '#c9a53f');
+}
+rect(ground, 445, 148, 15, 1, COOP.plank);                           // lit top edge of the tray
+
+// Water trough (left side of the yard)
+const WATER = { x: 62, y: 120 };
+for (let y = 104; y < 138; y++) for (let x = 38; x < 88; x++) {      // wet, darker dirt around it
+  const dx = (x - 62) / 25, dy = (y - 121) / 16;
+  if (dx * dx + dy * dy < 1 && noise(x, y) % 3 !== 0) rect(ground, x, y, 1, 1, 'rgba(70,45,20,.22)');
+}
+rect(ground, 48, 117, 34, 12, 'rgba(20,50,20,.3)');                  // shadow
+rect(ground, 46, 114, 32, 12, COOP.edgeDark);                        // outline
+rect(ground, 47, 115, 30, 10, COOP.plankDark);                       // wooden sides
+rect(ground, 47, 115, 30, 1, COOP.plank);
+rect(ground, 49, 117, 26, 6, '#3f86b8');                             // water
+rect(ground, 49, 117, 26, 1, '#6cb4de');
+rect(ground, 49, 122, 26, 1, '#2f6f9c');
+for (const x of [47, 76]) rect(ground, x, 115, 1, 10, COOP.edgeDark);   // end boards
+
+// Feeder: a round dish of grain
+const FEEDER = { x: 60, y: 178 };
+drawDisc(ground, FEEDER.x + 2, FEEDER.y + 3, 10, 'rgba(20,50,20,.3)');
+drawDisc(ground, FEEDER.x, FEEDER.y, 9.5, '#4a4e52');
+drawDisc(ground, FEEDER.x, FEEDER.y, 8.5, '#9aa0a6');
+drawDisc(ground, FEEDER.x, FEEDER.y, 7, '#6b4a2b');
+for (let i = 0; i < 40; i++) {                                       // grain
+  const a = noise(i, 1) % 628 / 100, r = Math.sqrt(noise(i, 2) % 100 / 100) * 6.2;
+  rect(ground, Math.round(FEEDER.x + Math.cos(a) * r), Math.round(FEEDER.y + Math.sin(a) * r), 1, 1, i % 3 ? '#e6c25a' : '#f2dc8a');
+}
+drawDisc(ground, FEEDER.x, FEEDER.y, 2, '#b8bcc0');
+rect(ground, FEEDER.x - 2, FEEDER.y - 3, 1, 1, '#ffffff');
+
+// Dust bowl: a dry dusty hollow where hens like to take a dust bath
+const DUST_BOWL = { x: 205, y: 98, radius: 13 };
+for (let y = DUST_BOWL.y - 15; y <= DUST_BOWL.y + 15; y++) for (let x = DUST_BOWL.x - 15; x <= DUST_BOWL.x + 15; x++) {
+  const d = Math.hypot((x - DUST_BOWL.x) / 1.15, y - DUST_BOWL.y) + (noise(x, y) % 5) * .25;
+  if (d > DUST_BOWL.radius) continue;
+  rect(ground, x, y, 1, 1, d > DUST_BOWL.radius - 2 ? '#8a6238' : d > DUST_BOWL.radius - 4 ? '#b48a58' : noise(x, y) % 3 ? '#d9be8e' : '#cfae78');
+}
+for (let i = 0; i < 6; i++) rect(ground, DUST_BOWL.x - 7 + noise(i, 5) % 14, DUST_BOWL.y - 4 + noise(i, 6) % 8, 2, 1, i % 2 ? '#ffffff' : '#a07a45');   // a few feathers
+
+// Chickens can't walk through the trough or the feeder
+OBSTACLES.push([52, 120, 6], [62, 120, 6], [72, 120, 6], [FEEDER.x, FEEDER.y, 9]);
+
+// Places a chicken stands while using each station: { x, y, face = direction she looks }
+const WATER_SPOTS = [52, 62, 72].flatMap(x => [{ x, y: 133, face: -Math.PI / 2 }, { x, y: 107, face: Math.PI / 2 }]);
+const FEEDER_SPOTS = Array.from({ length: 6 }, (_, k) => {
+  const a = k * Math.PI / 3 + Math.PI / 6;
+  return { x: FEEDER.x + Math.cos(a) * 16, y: FEEDER.y + Math.sin(a) * 16, face: a + Math.PI };
+});
+const BED_SPOT = { x: 402, y: 175 };                                // bottom of the ramp (chickens sleep in the coop)
+const COOP_DOOR_Y = 151;                                            // when a chicken climbs the ramp this high, she is inside
+
+
+/* ==========================================================================
+   4. CHICKEN LOOKS  –  color palettes + pre-drawn body parts
+   ========================================================================== */
+
+// One entry per hen "breed". body/wing/tail/comb are colors, speckled=1 adds dots.
+const HEN_PALETTES = [
+  { body: '#f3eee2', wing: '#ddd5c2', tail: '#cfc7b3', comb: '#e0382d' },                // white
+  { body: '#b8692d', wing: '#9c5222', tail: '#7a3d18', comb: '#d62f27' },                // brown
+  { body: '#3a3633', wing: '#2b2826', tail: '#1a3a30', comb: '#d62f27' },                // black
+  { body: '#d9b98a', wing: '#a77a48', tail: '#6b4a28', comb: '#d62f27', speckled: 1 },   // speckled tan
+  { body: '#a3431f', wing: '#862f14', tail: '#4a1c0c', comb: '#d62f27' },                // red
+  { body: '#eadfc9', wing: '#caa86d', tail: '#8c6b3a', comb: '#e0382d', speckled: 1 },   // speckled cream
+];
+
+// Roosters: body/wing/tail like hens, plus hackle = golden neck + back feathers, tailShine = glossy tail feathers
+const ROOSTER_PALETTES = [
+  { body: '#b5481f', wing: '#8c3315', tail: '#1f4d3a', tailShine: '#43b58a', hackle: '#e8a22c', comb: '#d8231f' },   // red-brown, gold neck
+  { body: '#2f2b29', wing: '#231f1e', tail: '#1b4a3d', tailShine: '#4fc7a0', hackle: '#d98a2b', comb: '#d8231f' },   // black-green, gold neck
+  { body: '#f1ead8', wing: '#d9ceb2', tail: '#e0d6bc', tailShine: '#ffffff', hackle: '#f2c86a', comb: '#d8231f' },   // white, gold neck
+];
+
+// Make a darker / lighter version of a hex color
+const shadeColor = (hex, factor) => '#' + [1, 3, 5].map(i =>
+  Math.round(clamp(parseInt(hex.slice(i, i + 2), 16) * factor, 0, 255)).toString(16).padStart(2, '0')
+).join('');
+
+[...HEN_PALETTES, ...ROOSTER_PALETTES].forEach(pal => {     // every palette gets the basic hen sprites first
+  pal.outline   = shadeColor(pal.body, .45);
+  pal.highlight = shadeColor(pal.body, parseInt(pal.body.slice(1, 3), 16) < 90 ? 1.7 : 1.12);
+
+  // Sprites are drawn once, then stamped (rotated/scaled) every frame.
+  pal.sprites = {};
+
+  // Tail: a fan of 5 feathers
+  pal.sprites.tail = makeSprite(14, 16, k => {
+    const fan = [-.75, -.38, 0, .38, .75];
+    for (const a of fan) for (let i = 0; i < 7; i++)
+      drawDisc(k, 13 - Math.cos(a) * i * 1.3, 8 + Math.sin(a) * i * 1.3, 2.3 - i * .1, pal.outline);
+    for (const a of fan) for (let i = 0; i < 7; i++)
+      drawDisc(k, 13 - Math.cos(a) * i * 1.3, 8 + Math.sin(a) * i * 1.3, 1.3, a ? pal.tail : pal.wing);
+  });
+
+  // Body: a rounded blob made of 5 circles
+  pal.sprites.body = makeSprite(24, 20, k => {
+    const blobs = [[-4, 3.9], [-1, 5], [2, 5], [5, 4.3], [8, 2.6]];
+    for (const [x, r] of blobs) drawDisc(k, 12 + x, 10, r + 1, pal.outline);
+    for (const [x, r] of blobs) drawDisc(k, 12 + x, 10, r, pal.body);
+    drawDisc(k, 12, 9, 2.8, pal.highlight);
+    drawDisc(k, 17, 10, 2, pal.highlight);
+    if (pal.speckled) for (let i = 0; i < 9; i++) {
+      k.fillStyle = pal.tail;
+      k.fillRect(8 + staticRandom() * 10 | 0, 6 + staticRandom() * 8 | 0, 1, 1);
+    }
+  });
+
+  // Wing (one sprite, used for both sides)
+  pal.sprites.wing = makeSprite(15, 8, k => {
+    for (let i = 0; i < 6; i++) drawDisc(k, 13 - i * 1.7, 4, 3.7 - i * .15, pal.outline);
+    for (let i = 0; i < 6; i++) drawDisc(k, 13 - i * 1.7, 4, 2.7 - i * .15, i > 3 ? pal.tail : pal.wing);
+    k.fillStyle = pal.tail;
+    for (const x of [8, 5]) k.fillRect(x, 2, 1, 5);
+  });
+
+  // Head with comb, beak and eyes
+  pal.sprites.head = makeSprite(12, 12, k => {
+    drawDisc(k, 5, 6, 3.5, pal.outline);
+    drawDisc(k, 5, 6, 2.6, pal.body);
+    for (const x of [4, 5.5, 7]) drawDisc(k, x, 6, 1, pal.comb);   // comb
+    k.fillStyle = '#f0a020'; k.fillRect(8, 5, 3, 2);               // beak
+    k.fillStyle = '#c97a10'; k.fillRect(8, 6, 3, 1);
+    k.fillStyle = '#111';    k.fillRect(6, 4, 1, 1); k.fillRect(6, 8, 1, 1);   // eyes
+  });
+});
+
+
+// Rooster-only sprites replace the hen ones: long curved tail, golden neck, tall comb + wattles.
+ROOSTER_PALETTES.forEach(pal => {
+  pal.tailOrigin = [21, 12];     // where the tail sprite attaches to the body
+  pal.headOrigin = [6, 7];
+
+  // Tail: 5 long sickle feathers that curve outward, glossy at the tips
+  pal.sprites.tail = makeSprite(22, 24, k => {
+    const feathers = [[-.55, 8], [-.28, 10], [0, 11], [.28, 10], [.55, 8]];       // [bend, length]
+    const spot = (a, i) => [21 - Math.cos(a * (1 + i * .03)) * i * 1.5, 12 + Math.sin(a * (1 + i * .03)) * i * 1.5];
+    for (const [a, len] of feathers) for (let i = 0; i < len; i++) { const [x, y] = spot(a, i); drawDisc(k, x, y, 2.1 - i * .06, pal.outline); }
+    for (const [a, len] of feathers) for (let i = 0; i < len; i++) {
+      const [x, y] = spot(a, i);
+      drawDisc(k, x, y, 1.25 - i * .02, i > len - 4 ? pal.tailShine : pal.tail);
+    }
+  });
+
+  // Wing: body-colored with a glossy green tip (so the wings don't look all green)
+  pal.sprites.wing = makeSprite(15, 8, k => {
+    for (let i = 0; i < 6; i++) drawDisc(k, 13 - i * 1.7, 4, 3.7 - i * .15, pal.outline);
+    for (let i = 0; i < 6; i++) drawDisc(k, 13 - i * 1.7, 4, 2.7 - i * .15, i > 4 ? pal.tail : pal.wing);
+    k.fillStyle = pal.hackle;
+    for (const x of [8, 5]) k.fillRect(x, 3, 1, 3);
+  });
+
+  // Body with golden hackle (neck) and saddle (back)
+  pal.sprites.body = makeSprite(24, 20, k => {
+    const blobs = [[-4, 3.9], [-1, 5], [2, 5], [5, 4.3], [8, 2.6]];
+    for (const [x, r] of blobs) drawDisc(k, 12 + x, 10, r + 1, pal.outline);
+    for (const [x, r] of blobs) drawDisc(k, 12 + x, 10, r, pal.body);
+    drawDisc(k, 7, 10, 3, pal.hackle);                    // saddle
+    drawDisc(k, 17, 10, 3.4, pal.hackle);                 // neck hackle
+    drawDisc(k, 18, 10, 2.2, shadeColor(pal.hackle, 1.18));
+    drawDisc(k, 12, 9, 2.4, pal.highlight);
+  });
+
+  // Head: tall comb (zigzag red bumps), two wattles under the beak, sharp beak
+  pal.sprites.head = makeSprite(14, 14, k => {
+    drawDisc(k, 6, 7, 3.6, pal.outline);
+    drawDisc(k, 6, 7, 2.7, pal.hackle);
+    for (const [x, y, r] of [[3, 7, 1.5], [4.6, 6, 1.6], [6.2, 8, 1.6], [7.6, 7, 1.2]]) drawDisc(k, x, y, r + .6, '#8c1410');
+    for (const [x, y, r] of [[3, 7, 1.5], [4.6, 6, 1.6], [6.2, 8, 1.6], [7.6, 7, 1.2]]) drawDisc(k, x, y, r, pal.comb);
+    k.fillStyle = '#f0a020'; k.fillRect(9, 6, 3, 2);
+    k.fillStyle = '#c97a10'; k.fillRect(9, 7, 3, 1);
+    drawDisc(k, 9, 4.5, 1, pal.comb); drawDisc(k, 9, 9.5, 1, pal.comb);     // wattles
+    k.fillStyle = '#111'; k.fillRect(6, 4, 1, 1); k.fillRect(6, 10, 1, 1);  // eyes
+  });
+});
+
+
+/* ==========================================================================
+   5. GAME STATE  –  lists of everything alive in the yard
+   ========================================================================== */
+// ----- Saved settings (remembered between visits, see section 12) -----
+const SAVE_KEY = 'hiyoko-yard-v1';
+function loadSave() { try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch (e) { return {}; } }
+const saved = loadSave();
+if (saved.sound === false) Sound.setOn(false);
+
+const birds    = [];    // every hen AND chick
+const hens     = [];    // only hens (chicks follow a hen as their "mom")
+const roosters = [];    // only roosters
+const ripples  = [];    // expanding rings (tap / feed / thunder effects)
+const sparks   = [];    // little flying particles
+let   bolts    = [];    // lightning bolts
+let   frameCount = 0;   // counts drawn frames (used for blinking effects)
+let   flashAmount = 0;  // white screen flash after lightning
+
+const eggs     = [];    // eggs lying in the nest tray: { x, y, slot, mom, age, hatchAt, brown }
+let   hawk = null;      // the hawk flying over right now (or null)
+let   hawkCounter = 0;  // gives every hawk an id so a chicken is only scared once per hawk
+let   paused = false;
+
+// ----- Time of day -----
+let dayTime = SETTINGS.startTime;                                            // clock 0..1 (see SETTINGS)
+let timeMode = ['auto', 'day', 'night'].includes(saved.timeMode) ? saved.timeMode : 'auto';   // auto = clock runs, or locked to day / night
+function nightTarget() {                                                     // how dark should it be right now? 0 = day ... 1 = night
+  if (timeMode === 'day') return 0;
+  if (timeMode === 'night') return 1;
+  const sun = Math.sin((dayTime - .25) * 6.2832);                            // +1 at noon, -1 at midnight
+  return clamp(.5 - sun * 2.5, 0, 1);
+}
+let nightAmount = nightTarget();                                             // fades smoothly toward nightTarget()
+
+// Fireflies come out at night
+const fireflies = Array.from({ length: 14 }, () => ({ x: liveRandom() * WIDTH, y: liveRandom() * HEIGHT, angle: liveRandom() * 6.28, phase: liveRandom() * 6 }));
+const [hawkCanvas, hawkCtx] = makeLayer();      // the hawk's shadow is drawn here first
+
+let   isRaining = false;
+let   rainAmount = 0;   // 0 = sunny ... 1 = full rain (fades smoothly)
+
+// Rain drops are just a list of positions that fall and wrap around
+const rainDrops = Array.from({ length: 90 }, () => ({ x: liveRandom() * WIDTH, y: liveRandom() * HEIGHT }));
+
+// ----- Butterflies: colors and shape (sizes are in pixels) -----
+// Each palette: wing = main wing color, wingLight = front (upper) wing color,
+//               accent = the spot on the wings, body = body / head / antennae
+const BUTTERFLY_PALETTES = [
+  { wing: '#e86fa8', wingLight: '#ffd1e8', accent: '#7b3fa0', body: '#3a2a3a' },   // pink
+  { wing: '#9fc8f0', wingLight: '#ffffff', accent: '#4f7fd0', body: '#2a2f3a' },   // white-blue
+  { wing: '#f08a1c', wingLight: '#ffd27a', accent: '#4a2a12', body: '#3a2414' },   // orange
+];
+const BUTTERFLY_LOOK = {
+  wingLength: 6,            // front-to-back size of the wings
+  wingWidth: 4,             // how far the wings spread when fully open
+  bodyLength: 3.5,
+  bodyWidth: .55,
+  headRadius: .8,
+  wingSpotRadius: .6,
+  antennaLength: 2,         // how far the antennae reach forward
+  antennaSpread: 1,         // how far they spread to the sides
+  flapSpeed: [9, 13],       // wing flap speed range (higher = faster)
+  shadowOffset: [2, 5],     // butterflies fly high, so the shadow lands away from them
+  shadowScale: .9,
+  shadowColor: '#14301c',
+};
+
+// 3 butterflies fluttering around (pink, white-blue, orange)
+const butterflies = BUTTERFLY_PALETTES.map((_, i) => ({
+  x: liveRandom() * WIDTH, y: liveRandom() * HEIGHT,
+  angle: liveRandom() * 6, flapPhase: liveRandom() * 9,
+  flapSpeed: between(BUTTERFLY_LOOK.flapSpeed),
+  palette: i,
+}));
+
+// "Food" = worms AND pellets, all stored in this one list.
+//   worm:   { isWorm:true, x, y, ... }       pellet: { x, y }
+let foodItems = [];
+
+
+/* ==========================================================================
+   6. WORMS & FOOD PELLETS
+   ========================================================================== */
+
+// Is this spot walkable? (inside the fence, not in the coop, not in a sunflower)
+const isOpenGround = (x, y) =>
+  x > 20 && x < WIDTH - 20 && y > 20 && y < HEIGHT - 24 &&
+  !(x > 372 && x < 466 && y > 104 && y < 180) &&           // worms stay out of the coop area
+  !OBSTACLES.some(([ox, oy, r]) => Math.hypot(x - ox, y - oy) < r + 3);
+
+// Create a worm. `growProgress` can be negative to delay when it appears.
+function makeWorm(growProgress) {
+  let x, y, tries = 0;
+  do { x = 30 + liveRandom() * 420; y = 30 + liveRandom() * 210; tries++; }
+  while (tries < 30 && !isOpenGround(x, y));
+  return {
+    isWorm: true,
+    x, y,                              // current position (head)
+    holeX: x, holeY: y,                // the hole it crawls out of
+    heading: liveRandom() * 6.28,      // direction it crawls
+    wigglePhase: liveRandom() * 6,
+    seed: liveRandom() * 6,
+    growth: growProgress || 0,         // 0..1 = crawling out of hole, 1 = fully out
+    age: 0,
+    held: 0,                           // 1 while a chicken is pecking it (it freezes)
+  };
+}
+foodItems = Array.from({ length: SETTINGS.wormCount }, () => makeWorm(-liveRandom() * 4));
+
+// Drop a handful of pellets near a random spot ("Feed" button)
+function feedChickens() {
+  const centerX = 240 + (liveRandom() - .5) * 160;
+  const centerY = 140 + (liveRandom() - .5) * 80;
+
+  for (let i = 0; i < SETTINGS.pelletsPerFeed; i++) {
+    let x, y, tries = 0;
+    do {
+      const angle = liveRandom() * 6.28, dist = Math.sqrt(liveRandom()) * 55;
+      x = centerX + Math.cos(angle) * dist;
+      y = centerY + Math.sin(angle) * dist * .7;
+      tries++;
+    } while (tries < 20 && !isOpenGround(x, y));
+    foodItems.push({ x, y });
+  }
+  ripples.push({ x: centerX, y: centerY, age: 0, color: '245,225,140', duration: .7, size: 40 });
+
+  // Everyone stops what they are doing and (after a short delay) heads for the food
+  for (const b of birds) {
+    if (b.inCoop || b.held || b.bedding) continue;
+    b.scareDelay = 0; b.fleeTime = 0;
+    clearTarget(b);
+    if (b.state === 'lay' || b.state === 'drink' || b.state === 'dust') { b.state = 'walk'; b.stateTimer = .3; }
+    b.foodCooldown = liveRandom() * .9 + Math.hypot(b.x - centerX, b.y - centerY) / 500;
+  }
+}
+
+
+/* ==========================================================================
+   7. CREATING CHICKENS
+   ========================================================================== */
+
+// kind = 'hen' | 'rooster' | 'chick'
+// A hen has wings and a palette. A rooster is a bigger hen with a tall comb, long tail and a crow.
+// A chick is a tiny yellow dot-bird that follows its mom hen.
+function makeBird(kind, paletteIndex, mom) {
+  const isChick = kind === 'chick', isRooster = kind === 'rooster';
+  const speedRange = isChick ? SETTINGS.chickSpeedRange : SETTINGS.henSpeedRange;
+  return {
+    isChick,
+    isRooster,
+    mom,
+    palette: isChick ? 0 : isRooster ? ROOSTER_PALETTES[paletteIndex % ROOSTER_PALETTES.length] : HEN_PALETTES[paletteIndex % HEN_PALETTES.length],
+    size:    isChick ? 1 : isRooster ? between(SETTINGS.roosterSize) : .9 + liveRandom() * .25,
+
+    // position & movement
+    x: mom ? mom.x + (liveRandom() - .5) * 30 : 60 + liveRandom() * 360,
+    y: mom ? mom.y + (liveRandom() - .5) * 30 : 50 + liveRandom() * 170,
+    angle: liveRandom() * 6.28,                       // direction it faces
+    speed: 0,                                         // current speed
+    cruiseSpeed: between(speedRange),                 // its own walking speed
+    turnAgility: .8 + liveRandom() * .4,              // how fast it can turn
+    wander: 0,                                        // small random steering drift
+
+    // behaviour:  walk | run | idle | peck | pivot | crow | lay | drink | dust | climb | descend | sleep | shock
+    state: 'walk',
+    stateTimer: liveRandom() * 2,                     // seconds until it picks a new behaviour
+    stridePhase: liveRandom() * 6,                    // walk-cycle animation clock
+    peckPhase: 0,                                     // pecking animation clock
+
+    // food hunting
+    target: null,                                     // the worm/pellet it is walking to
+    eating: null,                                     // the worm/pellet it is pecking now
+    chasing: false,                                   // true while heading to food
+    foodCooldown: 2 + liveRandom() * 6,               // seconds before it looks for food again
+
+    // reaction to a tap
+    scareX: 0, scareY: 0,                             // where the tap happened
+    scareDelay: 0,                                    // countdown until it reacts to the tap
+    fleeTime: 0,                                      // countdown of "run away from tap"
+    panicTime: 0,                                     // while > 0: keeps running after a scare
+    flapOnPanic: false,                               // true only when the scare came from a tap
+    flapPhase: 0,                                     // wing-flap animation clock
+    wingOpen: 0,                                      // 0 = wings folded ... 1 = fully flapping
+
+    // rooster crowing
+    crowCooldown: between([4, 10]),                   // seconds until the next crow
+    crowAge: 0,                                       // how long the current crow has lasted
+
+    // needs and routines (nest, water, feeder, dust bath)
+    activity: null,                                   // what it is doing at a station: { kind }
+    tripTime: 0,                                      // how long it has been walking to a station
+    thirst: liveRandom() * .8, thirstRate: 1 / between(SETTINGS.thirstEvery),
+    hunger: liveRandom() * .8, hungerRate: 1 / between(SETTINGS.hungerEvery),
+    layCooldown: between([15, 60]), layAge: 0,
+    dustCooldown: between([20, 70]), dustAge: 0,
+
+    // sleeping in the coop at night
+    bedding: false, inCoop: false, bedDelay: liveRandom() * 22, wakeDelay: 0,
+
+    // growing up (only chicks that hatched from an egg)
+    canGrow: false, growTimer: 0,
+
+    // rooster fights
+    rival: null, fightRole: null, fightTime: 0, puff: 0, rivalCooldown: between(SETTINGS.rivalEvery),
+
+    // carried by the player / seen by the hawk
+    held: false, hawkSeen: 0,
+
+    // lightning
+    shockTime: 0, jitterX: 0, jitterY: 0,
+  };
+}
+
+// ----- Adding and removing birds (used at start-up and by the + / − buttons) -----
+function addHen(paletteIndex) {
+  const hen = makeBird('hen', paletteIndex ?? (liveRandom() * HEN_PALETTES.length | 0));
+  hens.push(hen);
+  birds.push(hen);
+}
+function addRooster(paletteIndex) {
+  const rooster = makeBird('rooster', paletteIndex ?? (liveRandom() * ROOSTER_PALETTES.length | 0));
+  roosters.push(rooster);
+  birds.push(rooster);
+}
+const addChick = () => birds.push(makeBird('chick', 0, pickFrom(liveRandom, hens)));
+
+function removeBird(bird) {
+  endFight(bird);
+  if (drag && drag.bird === bird) drag = null;
+  clearTarget(bird);                                         // let go of any worm it was pecking
+  birds.splice(birds.indexOf(bird), 1);
+  for (const list of [hens, roosters]) if (list.includes(bird)) list.splice(list.indexOf(bird), 1);
+  for (const b of birds) if (b.mom === bird) b.mom = pickFrom(liveRandom, hens) || null;   // orphan chicks pick a new mom
+}
+const removeLast = list => { if (list.length) removeBird(list[list.length - 1]); };
+const removeChick = () => { for (let i = birds.length; i--;) if (birds[i].isChick) { removeBird(birds[i]); break; } };
+const chickCount = () => birds.filter(b => b.isChick).length;
+
+// Start with the flock you had last time (or the defaults from SETTINGS)
+const startCount = (key, fallback, max) => clamp(Number.isFinite(saved[key]) ? Math.round(saved[key]) : fallback, 0, max);
+for (let i = 0, n = startCount('hens', SETTINGS.startingHens, SETTINGS.maxHens); i < n; i++) addHen(i);
+for (let i = 0, n = startCount('roosters', SETTINGS.startingRoosters, SETTINGS.maxRoosters); i < n; i++) addRooster(i);
+for (let i = 0, n = startCount('chicks', SETTINGS.startingChicks, SETTINGS.maxChicks); i < n; i++) addChick();
+
+
+/* ==========================================================================
+   8. CHICKEN BRAINS  –  what each bird does every 1/60th of a second
+   ========================================================================== */
+
+// States where a bird is busy doing something and should not be sent somewhere else
+const BUSY_STATES = ['peck', 'crow', 'lay', 'drink', 'dust', 'climb', 'descend'];
+const isBusy = b => BUSY_STATES.includes(b.state);
+
+// Forget the current target / activity (and let go of a worm we were pecking)
+function clearTarget(b) {
+  if (b.eating) b.eating.held = 0;
+  b.eating = null;
+  b.target = null;
+  b.activity = null;
+}
+
+// Make a bird bolt away from a point and panic (run + flap wings)
+//   flapWings = true  -> also flap wings (only used for a tap on the screen)
+function startPanicRun(b, awayFromX, awayFromY, flapWings) {
+  endFight(b);
+  b.angle = Math.atan2(b.y - awayFromY, b.x - awayFromX) + (liveRandom() - .5) * .6;
+  b.state = 'run';
+  b.stateTimer = .9 + liveRandom() * .6;
+  b.speed = Math.max(b.speed, b.cruiseSpeed * SETTINGS.scaredRunBoost);
+  b.foodCooldown = 2.5;
+  b.fleeTime = SETTINGS.scaredFleeTime;
+  b.panicTime = SETTINGS.scaredPanicTime;       // keeps them running for a while
+  b.flapOnPanic = !!flapWings;                  // flap wings only if this came from a tap
+  b.layCooldown = Math.max(b.layCooldown, 6);   // a scared hen waits a bit before going to the nest again
+  clearTarget(b);
+}
+
+// --- 8a. Lightning paralysis. Returns true if the bird is stunned (skip the rest of its brain) ---
+function updateShock(b, dt) {
+  if (b.shockTime <= 0) return false;
+
+  b.shockTime -= dt;
+  b.speed = 0;
+  b.state = 'shock';
+  b.jitterX = Math.round((liveRandom() - .5) * 3);       // shaking
+  b.jitterY = Math.round((liveRandom() - .5) * 3);
+  if (liveRandom() < .5) sparks.push({
+    x: b.x + (liveRandom() - .5) * 14, y: b.y + (liveRandom() - .5) * 14,
+    vx: (liveRandom() - .5) * 50, vy: (liveRandom() - .5) * 50, life: .25, electric: 1,
+  });
+  if (b.shockTime <= 0) {                                 // recovered
+    b.state = 'idle'; b.stateTimer = .6;
+    b.jitterX = b.jitterY = 0;
+    b.foodCooldown = 2;
+  }
+  return true;
+}
+
+// --- 8b. Reaction to a tap / hawk: wait a moment, bolt away, keep pushing away for a while ---
+function updateScare(b, dt, steer) {
+  if (b.state === 'climb' || b.state === 'descend') { b.scareDelay = 0; b.fleeTime = 0; return; }   // on the ramp: ignore
+
+  if (b.scareDelay > 0) {
+    b.scareDelay -= dt;
+    if (b.scareDelay <= 0) {
+      startPanicRun(b, b.scareX, b.scareY, true);       // tap = run AND flap
+    }
+  }
+  if (b.fleeTime > 0) {
+    b.fleeTime -= dt;
+    const dx = b.x - b.scareX, dy = b.y - b.scareY, d = Math.hypot(dx, dy) || 1;
+    steer.x += dx / d * 3.5;
+    steer.y += dy / d * 3.5;
+  }
+
+  // Wing flapping: only while panicking AFTER A TAP. wingOpen eases toward 1, then back to 0.
+  if (b.panicTime > 0) {
+    b.panicTime -= dt;
+    if (b.flapOnPanic) b.flapPhase += dt * SETTINGS.wingFlapRate;
+  }
+  const wantOpen = (b.panicTime > 0 && b.flapOnPanic) ? 1 : 0;
+  b.wingOpen += (wantOpen - b.wingOpen) * Math.min(1, dt * 10);
+}
+
+// --- 8c. Rooster fights: one puffs up and chases the other, the other runs away ---
+function endFight(b) {
+  const rival = b.rival;
+  b.fightTime = 0; b.rival = null; b.fightRole = null;
+  if (rival && rival.rival === b) { rival.fightTime = 0; rival.rival = null; rival.fightRole = null; }
+}
+
+function startFight(b) {
+  b.rivalCooldown = between(SETTINGS.rivalEvery);
+  let rival = null, best = 220;
+  for (const other of roosters) {
+    if (other === b || other.inCoop || other.held || other.fightTime > 0 || other.panicTime > 0 || other.shockTime > 0) continue;
+    const d = Math.hypot(other.x - b.x, other.y - b.y);
+    if (d < best) { best = d; rival = other; }
+  }
+  if (!rival) return false;
+  b.fightRole = 'chaser';  b.rival = rival; b.fightTime = SETTINGS.fightTime;
+  rival.fightRole = 'runner'; rival.rival = b; rival.fightTime = SETTINGS.fightTime;
+  rival.rivalCooldown = Math.max(rival.rivalCooldown, 12);
+  clearTarget(b); clearTarget(rival);
+  b.state = rival.state = 'run';
+  return true;
+}
+
+function updateFight(b, dt, steer) {
+  const puffTarget = b.fightTime > 0 && b.fightRole === 'chaser' ? 1 : 0;       // chaser puffs up his feathers
+  b.puff += (puffTarget - b.puff) * Math.min(1, dt * 6);
+  if (b.fightTime <= 0) return;
+
+  const rival = b.rival;
+  if (!rival || rival.inCoop || rival.held || b.panicTime > 0) { endFight(b); return; }
+  b.fightTime -= dt;
+  const dx = rival.x - b.x, dy = rival.y - b.y, d = Math.hypot(dx, dy) || 1;
+  const sign = b.fightRole === 'chaser' ? 1 : -1;
+  steer.x += dx / d * 4.5 * sign;
+  steer.y += dy / d * 4.5 * sign;
+  b.state = 'run';
+  b.stateTimer = Math.max(b.stateTimer, .3);
+  if (sign === 1 && d < 16 && liveRandom() < dt * 10) {                          // feathers fly when he catches up
+    sparks.push({ x: rival.x, y: rival.y, vx: (liveRandom() - .5) * 60, vy: (liveRandom() - .5) * 60, life: .8, rgb: '250,245,230', size: 2 });
+  }
+  if (b.fightTime <= 0) {                                                        // fight over
+    const winner = b.fightRole === 'chaser';
+    endFight(b);
+    if (winner) { b.crowCooldown = 0; b.stateTimer = 0; }                        // the winner crows
+  }
+}
+
+// --- 8d. Steering forces: wandering, personal space, mom, rooster guarding, fence edges, obstacles ---
+function addSteeringForces(b, steer, dt) {
+  // random wandering
+  b.wander = clamp(b.wander + (liveRandom() - .5) * dt * 4, -.8, .8) * (1 - dt * .5);
+  steer.x += Math.cos(b.angle + b.wander);
+  steer.y += Math.sin(b.angle + b.wander);
+
+  // keep distance from other birds (hens loosely flock together)
+  for (const other of birds) {
+    if (other === b || other.inCoop) continue;
+    const dx = b.x - other.x, dy = b.y - other.y, d = Math.hypot(dx, dy) || 1;
+    const personalSpace = b.isChick ? 9 : (other.isChick ? 14 : 26);
+    if (d < personalSpace) {
+      const push = (personalSpace - d) / personalSpace * 1.8;
+      steer.x += dx / d * push;
+      steer.y += dy / d * push;
+    } else if (!b.isChick && !other.isChick && d < 100) {
+      steer.x += (other.x - b.x) / d * .012 + Math.cos(other.angle) * .1;
+      steer.y += (other.y - b.y) / d * .012 + Math.sin(other.angle) * .1;
+    }
+  }
+
+  // chicks stay close to mom
+  if (b.isChick && b.mom) {
+    const dx = b.mom.x - b.x, dy = b.mom.y - b.y, d = Math.hypot(dx, dy);
+    if (d > 16) {
+      const pull = Math.min(1.6, (d - 16) / 30);
+      steer.x += dx / d * pull;
+      steer.y += dy / d * pull;
+    }
+  }
+
+  // roosters keep an eye on the hens: they drift back if they wander too far away
+  if (b.isRooster && b.fightTime <= 0) {
+    let cx = 0, cy = 0, n = 0;
+    for (const hen of hens) if (!hen.inCoop) { cx += hen.x; cy += hen.y; n++; }
+    if (n) {
+      cx /= n; cy /= n;
+      const dx = cx - b.x, dy = cy - b.y, d = Math.hypot(dx, dy) || 1;
+      if (d > SETTINGS.guardRadius) {
+        const pull = Math.min(1.2, (d - SETTINGS.guardRadius) / 60);
+        steer.x += dx / d * pull;
+        steer.y += dy / d * pull;
+      }
+    }
+  }
+
+  // turn away from the fence
+  const margin = 34;
+  if (b.x < margin)          steer.x += (margin - b.x) / margin * 2.5;
+  if (b.x > WIDTH - margin)  steer.x -= (b.x - WIDTH + margin) / margin * 2.5;
+  if (b.y < margin)          steer.y += (margin - b.y) / margin * 2.5;
+  if (b.y > HEIGHT - margin) steer.y -= (b.y - HEIGHT + margin) / margin * 2.5;
+
+  // walk around the coop, trough and sunflowers (but not once we are close to our station: it is right next to them)
+  if (b.target && b.target.permanent && Math.hypot(b.target.x - b.x, b.target.y - b.y) < 28) return;
+  for (const [ox, oy, r] of OBSTACLES) {
+    const dx = b.x - ox, dy = b.y - oy, d = Math.hypot(dx, dy) || 1;
+    if (d < r + 8) {
+      const push = (r + 8 - d) / (r + 8) * 3;
+      steer.x += dx / d * push;
+      steer.y += dy / d * push;
+    }
+  }
+}
+
+// --- 8e. Look around for the closest worm / pellet ---
+function findFood(b) {
+  if (b.target && !b.target.dead) return;              // already has one
+  b.target = null;
+  if (b.foodCooldown > 0 || isBusy(b) || b.fightTime > 0 || b.bedding) return;
+
+  let best = null, bestDistance = 1e9;
+  for (const item of foodItems) {
+    if (item.dead) continue;
+    if (item.isWorm && item.growth < .6) continue;     // worm still hiding in its hole
+    const d = Math.hypot(item.x - b.x, item.y - b.y) * (item.isWorm ? SETTINGS.wormDistancePenalty : 1);
+    const sightRange = item.isWorm ? SETTINGS.wormSightRange : SETTINGS.pelletSightRange;
+    if (d < bestDistance && d < sightRange) { bestDistance = d; best = item; }
+  }
+  b.target = best;
+}
+
+// --- 8f. Walk / run toward the target (food or a station), then peck it / start the activity ---
+function arriveAtStation(b) {
+  const t = b.target;
+  b.target = null;
+  b.activity = { kind: t.kind };
+  b.speed *= .3;
+  if (t.kind === 'nest')   { b.state = 'lay';   b.stateTimer = SETTINGS.layTime;    b.layAge = 0; }
+  if (t.kind === 'water')  { b.state = 'drink'; b.stateTimer = SETTINGS.drinkTime; }
+  if (t.kind === 'feeder') { b.state = 'peck';  b.stateTimer = SETTINGS.feederTime; }
+  if (t.kind === 'dust')   { b.state = 'dust';  b.stateTimer = SETTINGS.dustTime;   b.dustAge = 0; }
+  if (t.kind === 'bed')    { b.state = 'climb'; b.stateTimer = 999; }
+  if (t.face !== undefined) b.angle = t.face;
+}
+
+// The nest and the ramp are on the south side of the coop. A bird north of the coop must walk around it first.
+function detourAroundCoop(b, t) {
+  if (t.kind !== 'nest' && t.kind !== 'bed') return null;
+  if (b.y < 160 && b.x > 372) return (b.y > 96 && b.x > 440) ? { x: b.x, y: 90 } : { x: 366, y: b.y };   // go north / west, past the coop
+  if (b.y < 170 && b.x <= 372) return { x: 372, y: 174 };                                              // then come round the bottom-left corner
+  return null;
+}
+
+function goToFood(b, steer) {
+  b.chasing = false;
+  if (!b.target || b.fightTime > 0 || isBusy(b)) return;
+
+  const t = b.target;
+  const dx = t.x - b.x, dy = t.y - b.y, d = Math.hypot(dx, dy) || 1;
+
+  if (d < (t.permanent ? 6 : SETTINGS.eatReach)) {     // arrived
+    if (t.permanent) arriveAtStation(b);
+    else { b.state = 'peck'; b.stateTimer = SETTINGS.peckTime; b.eating = t; t.held = 1; }
+  } else {
+    const aim = detourAroundCoop(b, t) || t;           // walk toward the target (or the corner we must pass first)
+    const ax = aim.x - b.x, ay = aim.y - b.y, ad = Math.hypot(ax, ay) || 1;
+    steer.x += ax / ad * 4;
+    steer.y += ay / ad * 4;
+    b.chasing = !t.calm;                                // food = a little faster; stations = normal walk
+    b.state = (d > SETTINGS.chaseRunDistance && !t.calm) ? 'run' : 'walk';
+  }
+}
+
+// --- 8g. Trips to the nest, water, feeder and dust bowl ---
+function startTrip(b, kind, spot) {
+  b.target = { x: spot.x, y: spot.y, face: spot.face, kind, permanent: true, calm: true };
+  b.tripTime = 0;
+  b.state = 'walk';
+  b.stateTimer = 2 + liveRandom() * 2;
+}
+
+// Does this bird feel like going somewhere? (Returns true if it started a trip)
+function maybeStartTrip(b) {
+  if (b.target || b.bedding || nightAmount > .5) return false;
+  const isHen = !b.isChick && !b.isRooster;
+  if (isHen && SETTINGS.eggsEnabled && b.layCooldown <= 0 && eggs.length < SETTINGS.maxEggs && birds.length < SETTINGS.maxBirds) {
+    startTrip(b, 'nest', NEST_SPOT); return true;
+  }
+  if (b.thirst > 1) { startTrip(b, 'water', pickFrom(liveRandom, WATER_SPOTS)); return true; }
+  if (b.hunger > 1) { startTrip(b, 'feeder', pickFrom(liveRandom, FEEDER_SPOTS)); return true; }
+  if (!b.isChick && b.dustCooldown <= 0) {
+    const a = liveRandom() * 6.28, r = liveRandom() * 6;
+    startTrip(b, 'dust', { x: DUST_BOWL.x + Math.cos(a) * r, y: DUST_BOWL.y + Math.sin(a) * r * .7, face: liveRandom() * 6.28 });
+    return true;
+  }
+  return false;
+}
+
+// What happens when a bird finishes an activity
+function finishActivity(b) {
+  const kind = b.activity && b.activity.kind;
+  if (kind === 'nest')        layEgg(b);
+  else if (kind === 'water')  b.thirst = 0;
+  else if (kind === 'feeder') b.hunger = 0;
+  else if (kind === 'dust')   b.dustCooldown = between(SETTINGS.dustEvery);
+  b.activity = null;
+  b.foodCooldown = 1 + liveRandom() * 3;
+}
+
+// --- 8h. Eggs: a hen lays one, it hatches, the chick grows up ---
+function layEgg(hen) {
+  hen.layCooldown = between(SETTINGS.layEvery);
+  const slot = EGG_SLOTS.findIndex((_, i) => !eggs.some(e => e.slot === i));
+  if (slot < 0) return;                                       // tray is full
+  const [x, y] = EGG_SLOTS[slot];
+  eggs.push({ x, y, slot, mom: hen, age: 0, hatchAt: between(SETTINGS.hatchTime), brown: liveRandom() < .4 });
+  for (let i = 0; i < 6; i++) sparks.push({ x, y, vx: (liveRandom() - .5) * 40, vy: -10 - liveRandom() * 25, life: .5, rgb: '255,243,220', size: 2 });
+  ripples.push({ x, y, age: 0, color: '255,243,200', duration: .5, size: 12 });
+  Sound.pip();
+  updateCounts();
+}
+
+function hatchEgg(egg) {
+  const mom = hens.includes(egg.mom) ? egg.mom : pickFrom(liveRandom, hens);
+  const chick = makeBird('chick', 0, mom);
+  chick.x = egg.x; chick.y = egg.y + 6;
+  chick.angle = Math.PI / 2 + (liveRandom() - .5);
+  chick.state = 'idle'; chick.stateTimer = .8; chick.speed = 0;
+  chick.canGrow = true;                                       // hatched chicks grow up into hens / roosters
+  chick.growTimer = between(SETTINGS.growUpTime);
+  birds.push(chick);
+  for (let i = 0; i < 10; i++) sparks.push({ x: egg.x, y: egg.y, vx: (liveRandom() - .5) * 60, vy: -15 - liveRandom() * 30, life: .6, rgb: '255,243,220', size: 2 });
+  ripples.push({ x: egg.x, y: egg.y, age: 0, color: '255,230,140', duration: .6, size: 16 });
+  Sound.peep();
+  updateCounts();
+}
+
+function updateEggs(dt) {
+  for (let i = eggs.length; i--;) {
+    const egg = eggs[i];
+    egg.age += dt;
+    if (egg.age >= egg.hatchAt && chickCount() < SETTINGS.maxChicks && birds.length < SETTINGS.maxBirds) {
+      eggs.splice(i, 1);
+      hatchEgg(egg);
+    }
+  }
+}
+
+function growUp(chick) {
+  let kind = liveRandom() < SETTINGS.roosterChance ? 'rooster' : 'hen';
+  if (kind === 'rooster' && roosters.length >= SETTINGS.maxRoosters) kind = 'hen';
+  if (kind === 'hen' && hens.length >= SETTINGS.maxHens) kind = roosters.length < SETTINGS.maxRoosters ? 'rooster' : null;
+  if (!kind) { chick.growTimer = 30; return; }                // flock is full: try again later
+
+  const adult = makeBird(kind, liveRandom() * 6 | 0);
+  adult.x = chick.x; adult.y = chick.y; adult.angle = chick.angle;
+  adult.layCooldown += 40;
+  adult.state = 'idle'; adult.stateTimer = 1;
+  removeBird(chick);
+  (kind === 'hen' ? hens : roosters).push(adult);
+  birds.push(adult);
+  for (let i = 0; i < 12; i++) sparks.push({ x: adult.x, y: adult.y, vx: (liveRandom() - .5) * 70, vy: (liveRandom() - .5) * 70, life: .8, rgb: '255,226,122', size: 2 });
+  ripples.push({ x: adult.x, y: adult.y, age: 0, color: '255,226,122', duration: .7, size: 22 });
+  Sound.pip();
+  updateCounts();
+}
+
+// --- 8i. Night: walk up the ramp and sleep in the coop, come out again in the morning ---
+const bedTarget = () => ({ x: BED_SPOT.x, y: BED_SPOT.y, face: -Math.PI / 2, kind: 'bed', permanent: true, calm: true });
+
+function checkBedtime(b, dt) {
+  if (nightAmount > .6 && !b.bedding) {
+    b.bedDelay -= dt;                                  // every bird gets sleepy at a slightly different time
+    if (b.bedDelay <= 0) { b.bedding = true; clearTarget(b); b.panicTime = 0; b.tripTime = 0; b.target = bedTarget(); b.state = 'walk'; }
+  } else if (nightAmount < .45) {
+    b.bedDelay = liveRandom() * 22;
+    if (b.bedding && b.state !== 'climb' && b.state !== 'descend') { b.bedding = false; if (b.target && b.target.kind === 'bed') b.target = null; }
+  }
+  // lost its way (e.g. got scared on the way to bed)? go back to the ramp
+  if (b.bedding && !b.target && !isBusy(b) && b.panicTime <= 0 && b.scareDelay <= 0 && b.shockTime <= 0) {
+    b.target = bedTarget(); b.tripTime = 0;
+  }
+}
+
+function walkRamp(b, dt) {
+  const up = b.state === 'climb', speed = b.cruiseSpeed * .8;
+  b.speed = speed;
+  b.angle = up ? -Math.PI / 2 : Math.PI / 2;
+  b.x += (BED_SPOT.x - b.x) * Math.min(1, dt * 6);
+  b.y += (up ? -speed : speed) * dt;
+  b.stridePhase += speed * dt * (b.isChick ? .9 : .35);
+  if (up && b.y <= COOP_DOOR_Y) {                      // inside the coop: hidden under the roof, asleep
+    b.inCoop = true; b.state = 'sleep'; b.speed = 0; b.activity = null; b.target = null;
+    b.wakeDelay = liveRandom() * 14;
+  }
+  if (!up && b.y >= BED_SPOT.y + 4) {                  // back on the grass
+    b.state = 'walk'; b.stateTimer = .5; b.speed = speed * .5;
+    b.foodCooldown = 1 + liveRandom() * 3;
+    b.angle = Math.PI / 2 + (liveRandom() - .5);
+    if (b.isRooster) { b.crowCooldown = 0; b.stateTimer = 0; }     // roosters crow in the morning
+  }
+}
+
+function updateSleeping(b, dt) {
+  b.layCooldown -= dt;
+  if (b.canGrow) b.growTimer -= dt;
+  b.thirst = Math.min(b.thirst, .9);                   // sleeping birds don't get thirsty or hungry
+  b.hunger = Math.min(b.hunger, .9);
+  if (nightAmount < .45) {
+    b.wakeDelay -= dt;
+    if (b.wakeDelay <= 0) {                            // wake up and walk down the ramp
+      b.inCoop = false; b.bedding = false;
+      b.x = BED_SPOT.x; b.y = COOP_DOOR_Y;
+      b.state = 'descend'; b.stateTimer = 999; b.speed = 0;
+    }
+  }
+}
+
+// --- 8j. Being carried by the player's finger ---
+function updateHeld(b, dt) {
+  if (!drag) { dropBird(b); return; }
+  b.x = clamp(b.x + (drag.x - b.x) * Math.min(1, dt * 14), 16, WIDTH - 16);
+  b.y = clamp(b.y + (drag.y - b.y) * Math.min(1, dt * 14), 15, HEIGHT - 19);
+  b.speed = 0; b.state = 'idle'; b.stateTimer = 1;
+  b.stridePhase += dt * 12;
+  b.jitterX = Math.round(Math.sin(b.stridePhase * 2));        // little wiggle
+  b.jitterY = -8 + Math.round(Math.sin(b.stridePhase * 1.3)); // lifted off the ground
+}
+
+// --- 8k. Things that change a little every tick: thirst, hunger, cooldowns, dust, sounds ---
+function tickNeeds(b, dt) {
+  b.thirst += dt * b.thirstRate;
+  b.hunger += dt * b.hungerRate;
+  b.layCooldown -= dt; b.dustCooldown -= dt; b.rivalCooldown -= dt;
+  if (b.isRooster) { b.crowCooldown -= dt; if (b.state === 'crow') b.crowAge += dt; }
+  if (b.canGrow) b.growTimer -= dt;
+  if (b.state === 'lay') b.layAge += dt;
+  if (b.state === 'dust') {
+    b.dustAge += dt;
+    if (liveRandom() < dt * 16) sparks.push({ x: b.x + (liveRandom() - .5) * 12, y: b.y + (liveRandom() - .5) * 10, vx: (liveRandom() - .5) * 30, vy: -8 - liveRandom() * 14, life: .7, rgb: '216,185,140', size: 2 });
+  }
+  if (b.state === 'drink' && liveRandom() < dt * 3) {
+    ripples.push({ x: b.x + Math.cos(b.angle) * 12 * b.size, y: b.y + Math.sin(b.angle) * 12 * b.size, age: 0, color: '190,225,250', duration: .5, size: 7 });
+    Sound.drink();
+  }
+  if (b.tripTime !== undefined && b.target && b.target.permanent) {
+    b.tripTime += dt;
+    if (b.tripTime > 45) clearTarget(b);                        // couldn't get there: give up
+  }
+  if (!b.isChick && liveRandom() < dt * .012) Sound.cluck();     // happy clucking now and then
+  if (b.isChick && liveRandom() < dt * .01) Sound.peep();
+}
+
+// --- 8l. When the behaviour timer runs out, finish what we were doing / pick something new ---
+function updateBehaviourTimer(b, dt) {
+  b.stateTimer -= dt;
+  if (b.stateTimer > 0) return;
+  if (b.state === 'climb' || b.state === 'descend') { b.stateTimer = 999; return; }     // (handled in walkRamp)
+
+  if (b.activity) finishActivity(b);
+
+  // finished pecking -> the food is eaten
+  if (b.state === 'peck' && b.eating) {
+    b.eating.dead = 1;
+    b.eating = null;
+    b.target = null;
+    b.hunger = Math.max(0, b.hunger - .7);
+    b.foodCooldown = 2 + liveRandom() * 5;
+  }
+
+  // still panicking from a tap? keep running
+  if (b.panicTime > 0) {
+    b.state = 'run';
+    b.stateTimer = .3;
+    return;
+  }
+  if (b.fightTime > 0) { b.stateTimer = .3; return; }
+
+  // roosters crow now and then (only when they are not busy going somewhere)
+  if (b.isRooster && !b.target && b.crowCooldown <= 0) {
+    b.state = 'crow';
+    b.stateTimer = SETTINGS.crowDuration;
+    b.crowAge = 0;
+    b.crowCooldown = between(SETTINGS.crowEvery);
+    Sound.crow();
+    return;
+  }
+
+  if (maybeStartTrip(b)) return;                          // go lay an egg / drink / eat / dust bathe
+
+  // roosters sometimes pick a fight with another rooster
+  if (b.isRooster && b.rivalCooldown <= 0 && roosters.length > 1 && !b.target && !b.bedding && nightAmount < .4 && startFight(b)) {
+    b.stateTimer = .3;
+    return;
+  }
+
+  // otherwise roll the dice for what to do next
+  const roll = liveRandom();
+  if (b.target)       b.state = 'walk';
+  else if (b.isChick) b.state = roll < .5 ? 'walk' : roll < .7 ? 'run' : roll < .85 ? 'peck' : 'idle';
+  else                b.state = roll < .45 ? 'walk' : roll < .65 ? 'idle' : roll < .85 ? 'peck' : roll < .93 ? 'pivot' : 'run';
+
+  b.stateTimer =
+    b.state === 'run'   ? .5 + liveRandom() * .6 :
+    b.state === 'peck'  ? .6 + liveRandom() * 1.2 :
+    b.state === 'pivot' ? .8 :
+                          1 + liveRandom() * 3;
+}
+
+// --- 8m. How fast does this bird WANT to go right now? ---
+function pickSpeed(b) {
+  const walk = b.cruiseSpeed;
+
+  // Rooster fight: chaser runs fast, runner runs a bit faster
+  if (b.fightTime > 0 && b.panicTime <= 0) return walk * (b.fightRole === 'chaser' ? 2.6 : 2.9);
+
+  // Heading to a worm / pellet: a little faster than a normal walk or run
+  if (b.chasing && b.panicTime <= 0) {
+    return b.state === 'run' ? walk * SETTINGS.chaseRunMultiplier
+                             : walk * SETTINGS.chaseWalkMultiplier;
+  }
+  switch (b.state) {
+    case 'walk':  return walk;
+    case 'run':   return walk * SETTINGS.scaredRunMultiplier;
+    case 'pivot': return walk * .4;
+    default:      return 0;                              // idle, peck, crow, lay, drink, dust
+  }
+}
+
+// --- 8n. Turn, speed up/down, move, and stay out of obstacles ---
+function moveBird(b, dt, steer) {
+  if (b.state === 'climb' || b.state === 'descend') { walkRamp(b, dt); return; }
+
+  const turnRate = ({ walk: 2.2, run: 4, idle: .6, peck: .2, pivot: 6, crow: .2, lay: 0, drink: 0, dust: 0 })[b.state] * b.turnAgility;
+  const wantedAngle = Math.atan2(steer.y, steer.x);
+  b.angle += clamp(wrapAngle(wantedAngle - b.angle), -turnRate * dt, turnRate * dt);
+
+  const wantedSpeed = pickSpeed(b);
+  b.speed += (wantedSpeed - b.speed) * Math.min(1, dt * (wantedSpeed > b.speed ? 5 : 9));
+
+  b.x = clamp(b.x + Math.cos(b.angle) * b.speed * dt, 16, WIDTH - 16);
+  b.y = clamp(b.y + Math.sin(b.angle) * b.speed * dt, 15, HEIGHT - 19);
+
+  // hard push-out if inside an obstacle
+  for (const [ox, oy, r] of OBSTACLES) {
+    const dx = b.x - ox, dy = b.y - oy, d = Math.hypot(dx, dy) || 1;
+    if (d < r) { b.x = ox + dx / d * r; b.y = oy + dy / d * r; }
+  }
+
+  // animation clocks
+  b.stridePhase += b.speed * dt * (b.isChick ? .9 : .35);
+  const lastPeck = Math.floor(b.peckPhase / Math.PI);
+  if (b.state === 'peck') b.peckPhase += dt * 14;
+  if (b.state === 'drink') b.peckPhase += dt * 7;
+  if (b.state === 'peck' && Math.floor(b.peckPhase / Math.PI) !== lastPeck) Sound.peck();     // tick each time the beak hits
+}
+
+// --- 8o. One bird, one tick ---
+function updateBird(b, dt) {
+  if (b.held) { updateHeld(b, dt); return; }              // carried by the player
+  if (b.inCoop) { updateSleeping(b, dt); return; }        // asleep inside the coop
+  if (updateShock(b, dt)) return;
+
+  const steer = { x: 0, y: 0 };            // sum of all "which way do I want to go" forces
+  tickNeeds(b, dt);
+  checkBedtime(b, dt);
+  updateScare(b, dt, steer);
+  updateFight(b, dt, steer);
+  addSteeringForces(b, steer, dt);
+
+  b.foodCooldown -= dt;
+  findFood(b);
+  goToFood(b, steer);
+  updateBehaviourTimer(b, dt);
+  moveBird(b, dt, steer);
+}
+
+
+/* ==========================================================================
+   9. THE WORLD TICK  –  runs 60 times per second
+   ========================================================================== */
+function updateWorms(dt) {
+  for (const worm of foodItems) {
+    if (!worm.isWorm || worm.dead) continue;
+
+    worm.wigglePhase += dt * 3;
+    if (worm.held) continue;                                   // being pecked -> frozen
+
+    // crawling out of the hole
+    if (worm.growth < 1) {
+      worm.growth = Math.min(1, worm.growth + dt / SETTINGS.wormGrowTime);
+      if (worm.growth > 0) {
+        worm.age += dt;
+        worm.x = worm.holeX + Math.cos(worm.heading) * worm.growth * 11;
+        worm.y = worm.holeY + Math.sin(worm.heading) * worm.growth * 11;
+      }
+      continue;
+    }
+
+    // crawling around (faster if a chicken is near)
+    worm.age += dt;
+    worm.heading += Math.sin(worm.wigglePhase * .4 + worm.seed) * dt * .9;
+    let crawlSpeed = SETTINGS.wormCrawlSpeed;
+    for (const b of birds) if (Math.hypot(b.x - worm.x, b.y - worm.y) < 30) { crawlSpeed = SETTINGS.wormFleeSpeed; break; }
+
+    const nextX = worm.x + Math.cos(worm.heading) * crawlSpeed * dt;
+    const nextY = worm.y + Math.sin(worm.heading) * crawlSpeed * dt;
+    if (isOpenGround(nextX, nextY)) { worm.x = nextX; worm.y = nextY; }
+    else worm.heading += 1.2;
+  }
+
+  // remove eaten food, spawn new worms to keep the count up
+  if (foodItems.some(f => f.dead)) foodItems = foodItems.filter(f => !f.dead);
+  if (foodItems.filter(f => f.isWorm).length < SETTINGS.wormCount && liveRandom() < dt * .4) foodItems.push(makeWorm());
+}
+
+function updateEffects(dt) {
+  // sparks
+  for (const s of sparks) { s.x += s.vx * dt; s.y += s.vy * dt; s.vx *= .97; s.vy *= .97; s.life -= dt; }
+  const aliveSparks = sparks.filter(s => s.life > 0);
+  sparks.splice(0, sparks.length, ...aliveSparks);
+
+  // lightning + flash + ripples
+  for (const k of bolts) k.life -= dt;
+  bolts = bolts.filter(k => k.life > 0);
+  flashAmount = Math.max(0, flashAmount - dt * 3);
+  for (const r of ripples) r.age += dt;
+  for (let i = ripples.length; i--;) if (ripples[i].age > ripples[i].duration) ripples.splice(i, 1);
+}
+
+function updateWeather(dt) {
+  rainAmount += ((isRaining ? 1 : 0) - rainAmount) * .03;
+  if (isRaining && liveRandom() < rainAmount * .6) {
+    ripples.push({ x: liveRandom() * WIDTH, y: liveRandom() * HEIGHT, age: 0, color: '200,230,255', duration: .7, size: 8 });
+  }
+  for (const d of rainDrops) {
+    d.y += 260 * dt; d.x -= 30 * dt;
+    if (d.y > HEIGHT) { d.y = -4; d.x = liveRandom() * WIDTH + 30; }
+  }
+}
+
+function updateTime(dt) {
+  if (timeMode === 'auto') dayTime = (dayTime + dt / SETTINGS.dayLength) % 1;
+  nightAmount += (nightTarget() - nightAmount) * Math.min(1, dt * 1.5);
+}
+
+function startHawk() {
+  if (hawk) return;
+  const fromLeft = liveRandom() < .5;
+  const x1 = fromLeft ? -50 : WIDTH + 50, x2 = fromLeft ? WIDTH + 50 : -50;
+  const y1 = 40 + liveRandom() * 190, y2 = 40 + liveRandom() * 190;
+  const dist = Math.hypot(x2 - x1, y2 - y1);
+  hawk = {
+    id: ++hawkCounter, x: x1, y: y1, angle: Math.atan2(y2 - y1, x2 - x1), wingPhase: 0, age: 0,
+    vx: (x2 - x1) / dist * SETTINGS.hawkSpeed, vy: (y2 - y1) / dist * SETTINGS.hawkSpeed,
+    life: dist / SETTINGS.hawkSpeed,
+  };
+  Sound.screech();
+}
+
+function updateHawk(dt) {
+  if (!hawk) return;
+  hawk.age += dt; hawk.x += hawk.vx * dt; hawk.y += hawk.vy * dt; hawk.wingPhase += dt * 6;
+  for (const b of birds) {                       // chickens near the shadow bolt (and flap, like after a tap)
+    if (b.inCoop || b.held || b.shockTime > 0 || b.hawkSeen === hawk.id) continue;
+    if (Math.hypot(b.x - hawk.x, b.y - hawk.y) < SETTINGS.hawkScareRadius) {
+      b.hawkSeen = hawk.id;
+      b.scareX = hawk.x; b.scareY = hawk.y;
+      b.scareDelay = .05 + liveRandom() * .3;
+      b.fleeTime = 0;
+    }
+  }
+  if (hawk.age > hawk.life) hawk = null;
+}
+
+function updateButterflies(dt) {
+  for (const f of fireflies) {                   // fireflies drift slowly
+    f.angle += (liveRandom() - .5) * dt * 4;
+    f.x += Math.cos(f.angle) * 6 * dt; f.y += Math.sin(f.angle) * 6 * dt;
+    if (f.x < 8 || f.x > WIDTH - 8 || f.y < 8 || f.y > HEIGHT - 8) f.angle = Math.atan2(HEIGHT / 2 - f.y, WIDTH / 2 - f.x);
+  }
+  for (const f of butterflies) {
+    f.angle += (liveRandom() - .5) * dt * 8;
+    f.x += Math.cos(f.angle) * 18 * dt;
+    f.y += Math.sin(f.angle) * 18 * dt;
+    f.flapPhase += dt;
+    if (f.x < 10 || f.x > WIDTH - 10 || f.y < 10 || f.y > HEIGHT - 10) {
+      f.angle = Math.atan2(HEIGHT / 2 - f.y, WIDTH / 2 - f.x);       // head back to the middle
+    }
+  }
+}
+
+function step(dt) {
+  if (paused) return;
+  updateTime(dt);
+  for (const b of birds) updateBird(b, dt);
+  for (const b of birds.filter(x => x.canGrow && x.growTimer <= 0 && !x.inCoop && !x.held)) growUp(b);   // chicks grow up
+  updateEggs(dt);
+  updateHawk(dt);
+  updateEffects(dt);
+  updateWorms(dt);
+  updateWeather(dt);
+  updateButterflies(dt);
+}
+
+
+/* ==========================================================================
+   10. DRAWING
+   ========================================================================== */
+
+// --- 10-. Butterfly drawing helpers ---
+
+// Fill a triangle with hard pixel edges (a pixel is filled if its center is inside)
+function fillTriangle(c, a, b, d, color) {
+  c.fillStyle = color;
+  const minX = Math.floor(Math.min(a.x, b.x, d.x)), maxX = Math.ceil(Math.max(a.x, b.x, d.x));
+  const minY = Math.floor(Math.min(a.y, b.y, d.y)), maxY = Math.ceil(Math.max(a.y, b.y, d.y));
+  const edge = (p, q, x, y) => (q.x - p.x) * (y - p.y) - (q.y - p.y) * (x - p.x);
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const px = x + .5, py = y + .5;
+      const e1 = edge(a, b, px, py), e2 = edge(b, d, px, py), e3 = edge(d, a, px, py);
+      if ((e1 >= 0 && e2 >= 0 && e3 >= 0) || (e1 <= 0 && e2 <= 0 && e3 <= 0)) c.fillRect(x, y, 1, 1);
+    }
+  }
+}
+
+// Draw a 1-pixel-thick line
+function drawPixelLine(c, p, q, color) {
+  c.fillStyle = color;
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(q.x - p.x), Math.abs(q.y - p.y))));
+  for (let i = 0; i <= steps; i++) {
+    c.fillRect(Math.round(p.x + (q.x - p.x) * i / steps), Math.round(p.y + (q.y - p.y) * i / steps), 1, 1);
+  }
+}
+
+// Which way is the butterfly facing, and how open are its wings right now?
+function butterflyPose(f) {
+  const forward = { x: Math.cos(f.angle), y: Math.sin(f.angle) };
+  const side = { x: -forward.y, y: forward.x };
+  const flap = .3 + Math.abs(Math.sin(f.flapPhase * f.flapSpeed)) * .7;       // 0.3 (nearly closed) .. 1 (wide open)
+  const wingWidth = BUTTERFLY_LOOK.wingWidth * (.28 + flap * .72);
+  return { forward, side, wingWidth };
+}
+
+// Both wings: each side is a light front triangle + a main-color back triangle
+function drawButterflyWings(c, center, forward, side, length, width, primary, light) {
+  for (const dir of [-1, 1]) {
+    const shoulder   = { x: center.x + forward.x * length * .2, y: center.y + forward.y * length * .2 };
+    const outerFront = { x: center.x + side.x * width * dir + forward.x * length * .42,
+                         y: center.y + side.y * width * dir + forward.y * length * .42 };
+    const outerBack  = { x: center.x + side.x * width * .82 * dir - forward.x * length * .48,
+                         y: center.y + side.y * width * .82 * dir - forward.y * length * .48 };
+    const tail       = { x: center.x - forward.x * length * .68, y: center.y - forward.y * length * .68 };
+    fillTriangle(c, shoulder, outerFront, outerBack, light);
+    fillTriangle(c, shoulder, outerBack, tail, primary);
+  }
+}
+
+// Shadow on the ground (goes on the bird-shadow layer, which is drawn see-through)
+function drawButterflyShadow(f) {
+  const { forward, side, wingWidth } = butterflyPose(f), L = BUTTERFLY_LOOK;
+  drawButterflyWings(birdShadow,
+    { x: f.x + L.shadowOffset[0], y: f.y + L.shadowOffset[1] },
+    forward, side, L.wingLength * L.shadowScale, wingWidth * L.shadowScale, L.shadowColor, L.shadowColor);
+}
+
+// The butterfly: wings, body, head, wing spots, antennae
+function drawButterfly(f) {
+  const L = BUTTERFLY_LOOK, pal = BUTTERFLY_PALETTES[f.palette];
+  const { forward, side, wingWidth } = butterflyPose(f);
+  const center = { x: f.x, y: f.y };
+
+  drawButterflyWings(ctx, center, forward, side, L.wingLength, wingWidth, pal.wing, pal.wingLight);
+
+  // body (two triangles + a line so it never breaks up) and head
+  const front = { x: f.x + forward.x * L.bodyLength * .58, y: f.y + forward.y * L.bodyLength * .58 };
+  const back  = { x: f.x - forward.x * L.bodyLength * .58, y: f.y - forward.y * L.bodyLength * .58 };
+  const half  = { x: side.x * L.bodyWidth, y: side.y * L.bodyWidth };
+  fillTriangle(ctx, { x: front.x + half.x, y: front.y + half.y }, { x: front.x - half.x, y: front.y - half.y }, { x: back.x - half.x, y: back.y - half.y }, pal.body);
+  fillTriangle(ctx, { x: front.x + half.x, y: front.y + half.y }, { x: back.x - half.x, y: back.y - half.y }, { x: back.x + half.x, y: back.y + half.y }, pal.body);
+  drawPixelLine(ctx, back, front, pal.body);
+  drawDisc(ctx, front.x, front.y, L.headRadius, pal.body);
+
+  // one spot on each wing
+  const spotDistance = wingWidth * .68;
+  for (const dir of [-1, 1]) {
+    drawDisc(ctx,
+      f.x + side.x * spotDistance * dir - forward.x * L.wingLength * .08,
+      f.y + side.y * spotDistance * dir - forward.y * L.wingLength * .08,
+      L.wingSpotRadius, pal.accent);
+  }
+
+  // antennae
+  const root = { x: front.x + forward.x * L.headRadius * .4, y: front.y + forward.y * L.headRadius * .4 };
+  for (const dir of [-1, 1]) {
+    drawPixelLine(ctx, root, {
+      x: root.x + forward.x * L.antennaLength + side.x * dir * L.antennaSpread,
+      y: root.y + forward.y * L.antennaLength + side.y * dir * L.antennaSpread,
+    }, pal.body);
+  }
+}
+
+// --- 10a. Hen (tail, body, wings, head, feet, all rotated to face her heading) ---
+function drawHen(b) {
+  const angle = b.angle + (b.state === 'dust' ? Math.sin(b.dustAge * 14) * .4 : 0);     // rolls from side to side in a dust bath
+  const cos = Math.cos(angle), sin = Math.sin(angle), size = b.size * (1 + .12 * b.puff), sprites = b.palette.sprites;   // puff = rooster fluffed up in a fight
+  const isRunning = b.state === 'run', isShocked = b.shockTime > 0;
+  const moveAmount = Math.min(1, b.speed / 15);
+
+  // little hop while flapping in panic
+  const hop = Math.abs(Math.sin(b.flapPhase * .5)) * b.wingOpen * SETTINGS.henHopHeight;
+
+  // body sways side to side while walking
+  const sway = Math.sin(b.stridePhase * 2) * .8 * moveAmount + (b.state === 'lay' ? Math.sin(b.layAge * 16) * .6 : 0);   // shakes a little while laying
+  const bodyX = b.x + b.jitterX - sin * sway;
+  const bodyY = b.y + b.jitterY + cos * sway;
+
+  // local(t,u): point t pixels FORWARD and u pixels to the SIDE of the hen, in screen coordinates
+  const local = (t, u, lift = hop) => [
+    bodyX + cos * t * size - sin * u * size,
+    bodyY + sin * t * size + cos * u * size - lift,
+  ];
+  const stamp = (img, x, y, angle, originX, originY) => {
+    ctx.save();
+    ctx.translate(Math.round(x), Math.round(y));
+    ctx.rotate(angle);
+    ctx.scale(size, size);
+    ctx.drawImage(img, -originX, -originY);
+    ctx.restore();
+  };
+
+  // feet (stay on the ground, they do not hop)
+  for (const side of [-1, 1]) {
+    const [fx, fy] = local(1 + Math.sin(b.stridePhase * 2) * 2.4 * side * moveAmount, side * 5.2, 0);
+    ctx.fillStyle = '#e8a020';
+    ctx.fillRect(Math.round(fx), Math.round(fy), 2, 1);
+  }
+
+  // tail
+  let [x, y] = local(-6, 0);
+  stamp(sprites.tail, x, y,
+    angle + Math.sin(b.stridePhase * 2 + 1) * .18 * moveAmount + (isRunning ? Math.sin(b.stridePhase * 4) * .12 : 0),
+    ...(b.palette.tailOrigin || [13, 8]));
+
+  // body
+  stamp(sprites.body, bodyX, bodyY - hop, angle + Math.sin(b.stridePhase * 2) * .06 * moveAmount, 12, 10);
+
+  // wings. spread = how far each wing swings away from the body (radians)
+  // Wings stay folded for walking AND normal running. They only open when wingOpen > 0 (after a tap).
+  const foldedSpread = .04;
+  const flapSpread   = SETTINGS.wingFlapOpen + Math.sin(b.flapPhase) * SETTINGS.wingFlapSwing;
+  let spread = foldedSpread + (flapSpread - foldedSpread) * b.wingOpen;
+  if (isShocked) spread = .9;                                                        // stunned: wings stuck out
+  for (const side of [-1, 1]) {
+    [x, y] = local(3, side * 3.6);
+    stamp(sprites.wing, x, y, angle - side * spread, 13, 4);
+  }
+
+  // head (stretches forward while pecking / walking)
+  const reach = isShocked ? 0
+    : (b.state === 'peck' || b.state === 'drink') ? Math.abs(Math.sin(b.peckPhase)) * 5
+    : b.state === 'crow' ? 3 + Math.sin(b.crowAge * 18) * 1.2                 // head thrust forward, shaking
+    : Math.sin(b.stridePhase * 2) * 1.6 * moveAmount + (isRunning ? 1.5 : 0);
+  [x, y] = local(9 + reach, 0);
+  stamp(sprites.head, x, y, angle + (isShocked ? 0 : Math.sin(b.stridePhase * 2) * .08 * moveAmount),
+    ...(b.palette.headOrigin || [5, 6]));
+}
+
+// --- 10a-2. Rooster crow effect: sound arcs spreading from the beak + two little music notes ---
+function drawCrowEffect(b) {
+  const cos = Math.cos(b.angle), sin = Math.sin(b.angle);
+  const mouthX = b.x + cos * 15 * b.size, mouthY = b.y + sin * 15 * b.size;
+  for (let k = 0; k < 3; k++) {                                   // 3 arcs, one after another
+    const t = (b.crowAge * 1.7 + k / 3) % 1, radius = 3 + t * 20;
+    for (let i = -6; i <= 6; i++) {
+      const a = b.angle + i * .11;
+      const x = Math.round(mouthX + Math.cos(a) * radius), y = Math.round(mouthY + Math.sin(a) * radius);
+      ctx.fillStyle = `rgba(90,60,30,${(1 - t) * .45})`; ctx.fillRect(x + 1, y + 1, 1, 1);   // soft dark edge so it shows on light dirt
+      ctx.fillStyle = `rgba(255,252,225,${(1 - t) * .95})`; ctx.fillRect(x, y, 1, 1);
+    }
+  }
+  for (let n = 0; n < 2; n++) {                                   // music notes floating up
+    const t = (b.crowAge * .9 + n * .5) % 1;
+    const x = Math.round(mouthX + cos * (6 + t * 10) + (n ? 5 : -5)), y = Math.round(mouthY + sin * (6 + t * 10) - 4 - t * 12);
+    ctx.fillStyle = `rgba(90,60,30,${(1 - t) * .5})`;
+    ctx.fillRect(x + 1, y + 1, 2, 5);                             // note shadow
+    ctx.fillStyle = `rgba(255,226,122,${1 - t})`;
+    ctx.fillRect(x, y + 3, 2, 2);                                 // note head
+    ctx.fillRect(x + 1, y, 1, 4);                                 // stem
+    ctx.fillRect(x + 1, y, 2, 1);                                 // flag
+  }
+}
+
+// --- 10-b. Eggs in the nest tray (they wobble and crack just before hatching) ---
+function drawEggs() {
+  for (const egg of eggs) {
+    const remaining = egg.hatchAt - egg.age;
+    const wobble = remaining < 4 ? Math.round(Math.sin(egg.age * (remaining < 1.5 ? 40 : 18)) * (remaining < 1.5 ? 1.2 : .6)) : 0;
+    const x = Math.round(egg.x) + wobble, y = Math.round(egg.y);
+    const base = egg.brown ? '#d9a066' : '#fff3dc', shade = egg.brown ? '#b57b44' : '#e0cba2';
+    ctx.fillStyle = 'rgba(60,40,20,.3)'; ctx.fillRect(x - 2, y + 3, 4, 1);        // shadow
+    ctx.fillStyle = base;
+    ctx.fillRect(x - 1, y - 2, 2, 1);                                              // top
+    ctx.fillRect(x - 2, y - 1, 4, 3);                                              // middle
+    ctx.fillRect(x - 1, y + 2, 2, 1);                                              // bottom
+    ctx.fillStyle = shade;
+    ctx.fillRect(x + 1, y, 1, 2); ctx.fillRect(x, y + 2, 1, 1);                    // shaded side
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(x - 1, y - 1, 1, 1);                   // shine
+    if (remaining < 1.5) { ctx.fillStyle = '#7a5532'; ctx.fillRect(x - 1, y, 1, 1); ctx.fillRect(x, y + 1, 1, 1); ctx.fillRect(x - 1, y + 2, 1, 1); }   // cracks
+  }
+}
+
+// --- 10-c. Sparkles on the water trough ---
+function drawStations() {
+  for (let i = 0; i < 4; i++) {
+    const t = frameCount >> 3;
+    ctx.fillStyle = '#d8f2ff';
+    ctx.fillRect(50 + noise(i + t, 7) % 24, 118 + noise(i, t + 3) % 4, 1, 1);
+  }
+}
+
+// --- 10-d. The hawk's shadow gliding over the yard ---
+function drawHawk() {
+  if (!hawk) return;
+  hawkCtx.clearRect(0, 0, WIDTH, HEIGHT);
+  const cos = Math.cos(hawk.angle), sin = Math.sin(hawk.angle);
+  const P = (t, u) => ({ x: hawk.x + cos * t - sin * u, y: hawk.y + sin * t + cos * u });    // t = forward, u = sideways
+  const span = 40 * (.6 + .4 * Math.sin(hawk.wingPhase));                                      // wings move up and down
+  for (const side of [-1, 1]) {
+    fillTriangle(hawkCtx, P(9, side * 4), P(0, side * span), P(-12, side * 5), '#000');       // front half of the wing
+    fillTriangle(hawkCtx, P(-12, side * 5), P(0, side * span), P(-22, side * span * .6), '#000');   // feathers at the back
+    fillTriangle(hawkCtx, P(-12, side * 5), P(-22, side * span * .6), P(-16, side * 4), '#000');
+  }
+  fillTriangle(hawkCtx, P(-10, -5), P(-10, 5), P(-34, 8), '#000');                            // tail
+  fillTriangle(hawkCtx, P(-10, -5), P(-34, 8), P(-34, -8), '#000');
+  const body = P(0, 0), head = P(11, 0);
+  drawDisc(hawkCtx, body.x, body.y, 5.5, '#000');
+  drawDisc(hawkCtx, head.x, head.y, 3.2, '#000');
+  ctx.globalAlpha = .36;
+  ctx.drawImage(hawkCanvas, 0, 0);
+  ctx.globalAlpha = 1;
+}
+
+// --- 10-e. Night: dark blue tint, warm dusk, light from the coop door, fireflies ---
+function drawNight() {
+  const night = nightAmount, dusk = 4 * night * (1 - night);        // dusk is strongest halfway between day and night
+  if (dusk > .01) { ctx.fillStyle = `rgba(255,140,60,${.2 * dusk})`; ctx.fillRect(0, 0, WIDTH, HEIGHT); }
+  if (night > .01) { ctx.fillStyle = `rgba(14,24,70,${SETTINGS.nightTint * night})`; ctx.fillRect(0, 0, WIDTH, HEIGHT); }
+  if (night > .05) {
+    const glow = ctx.createRadialGradient(402, 166, 2, 402, 166, 36);        // warm light from the hen door
+    glow.addColorStop(0, `rgba(255,200,110,${.6 * night})`);
+    glow.addColorStop(1, 'rgba(255,200,110,0)');
+    ctx.fillStyle = glow; ctx.fillRect(360, 130, 90, 80);
+  }
+  if (night > .3) {
+    for (const f of fireflies) {
+      const blink = Math.max(0, Math.sin(frameCount * .05 + f.phase));
+      const a = Math.min(1, (night - .3) * 1.5) * (.25 + .75 * blink);
+      ctx.fillStyle = `rgba(232,255,138,${a * .25})`; ctx.fillRect((f.x | 0) - 1, (f.y | 0) - 1, 3, 3);
+      ctx.fillStyle = `rgba(255,251,176,${a})`;       ctx.fillRect(f.x | 0, f.y | 0, 1, 1);
+    }
+  }
+}
+
+// --- 10b. Chick (yellow ball with a head and a beak) ---
+function drawChick(b) {
+  const cos = Math.cos(b.angle), sin = Math.sin(b.angle), moveAmount = Math.min(1, b.speed / 12);
+  const x = b.x + b.jitterX;
+  const y = b.y + b.jitterY - Math.abs(Math.sin(b.stridePhase * 3)) * 2 * moveAmount;     // hopping bob
+  const peckReach = (b.state === 'peck' || b.state === 'drink') ? Math.abs(Math.sin(b.peckPhase)) * 1.5 : 0;
+
+  // feet
+  ctx.fillStyle = '#f08a20';
+  for (const side of [-1, 1]) {
+    ctx.fillRect(
+      Math.round(b.x + cos * Math.sin(b.stridePhase * 3) * side * 1.5 - sin * side * 2.2),
+      Math.round(b.y + sin * Math.sin(b.stridePhase * 3) * side * 1.5 + cos * side * 2.2), 1, 1);
+  }
+  // body + highlight + tiny wings
+  drawDisc(ctx, x, y, 3.4, '#c28a12');
+  drawDisc(ctx, x, y, 2.5, '#ffd23f');
+  drawDisc(ctx, x - 1, y - 1, 1.2, '#fff0a0');
+  drawDisc(ctx, x - sin * 1.8, y + cos * 1.8, 1.2, '#f0b020');
+  drawDisc(ctx, x + sin * 1.8, y - cos * 1.8, 1.2, '#f0b020');
+  // head
+  const headX = x + cos * (2.3 + peckReach), headY = y + sin * (2.3 + peckReach);
+  drawDisc(ctx, headX, headY, 2.6, '#c28a12');
+  drawDisc(ctx, headX, headY, 1.7, '#ffe680');
+  // beak
+  ctx.fillStyle = '#f08a20';
+  ctx.fillRect(Math.round(x + cos * (4.2 + peckReach)), Math.round(y + sin * (4.2 + peckReach)), 1, 1);
+}
+
+// --- 10c. Expanding ring effect ---
+function drawRipple(r) {
+  const progress = r.age / r.duration;
+  const radius = 3 + progress * (r.size || 45);
+  const dots = Math.max(12, radius * 2 | 0);
+  ctx.fillStyle = `rgba(${r.color},${(1 - progress) * .8})`;
+  for (let i = 0; i < dots; i++) {
+    const t = i / dots * 6.283;
+    ctx.fillRect(Math.round(r.x + Math.cos(t) * radius), Math.round(r.y + Math.sin(t) * radius * .75), 1, 1);
+  }
+}
+
+// --- 10d. Worms and pellets ---
+function drawFood() {
+  for (const item of foodItems) {
+    if (item.dead) continue;
+
+    if (item.isWorm) {
+      if (item.growth <= 0) continue;                           // not out of the ground yet
+      if (item.age < 7) {                                       // dark hole fades away
+        ctx.globalAlpha = Math.min(1, (7 - item.age) / 2);
+        drawDisc(ctx, item.holeX, item.holeY, 3.2, '#7a5430');
+        drawDisc(ctx, item.holeX, item.holeY, 2.2, '#3e2814');
+        ctx.globalAlpha = 1;
+      }
+      const cos = Math.cos(item.heading), sin = Math.sin(item.heading), segments = 7;
+      for (let i = 0; i < segments && i <= item.growth * segments; i++) {
+        const wiggle = Math.sin(item.wigglePhase - i * .9) * 1.3;
+        ctx.fillStyle = i % 2 ? '#d9736c' : '#f08c84';
+        ctx.fillRect(Math.round(item.x - cos * i * 1.6 - sin * wiggle), Math.round(item.y - sin * i * 1.6 + cos * wiggle), 2, 2);
+      }
+    } else {                                                    // pellet (corn)
+      ctx.fillStyle = '#f5d77a'; ctx.fillRect(item.x | 0, item.y | 0, 2, 2);
+      ctx.fillStyle = '#d9a93a'; ctx.fillRect((item.x | 0) + 1, (item.y | 0) + 1, 1, 1);
+    }
+  }
+}
+
+// --- 10e. Whole frame, back to front ---
+function draw() {
+  // 1) ground (+ sparkles on the water)
+  ctx.drawImage(groundCanvas, 0, 0);
+  drawStations();
+
+  // 2) shadows under every bird
+  birdShadow.clearRect(0, 0, WIDTH, HEIGHT);
+  for (const b of birds) {
+    if (b.inCoop) continue;                                    // sleeping birds are inside the coop
+    if (b.isChick) {
+      drawDisc(birdShadow, b.x + 1.5, b.y + 2.5, 2.4, '#14301c');
+    } else {
+      const cos = Math.cos(b.angle), sin = Math.sin(b.angle), r = 7 * b.size;
+      for (const t of [-.5, 0, .5]) drawDisc(birdShadow, b.x + cos * t * r + 3, b.y + sin * t * r + 4, r * .85, '#14301c');
+    }
+  }
+  if (nightAmount < .5) for (const f of butterflies) drawButterflyShadow(f);      // butterflies sleep at night
+  ctx.globalAlpha = .3;
+  ctx.drawImage(birdShadowCanvas, 0, 0);
+  ctx.globalAlpha = 1;
+
+  // 3) worms, pellets, eggs, ripples
+  drawFood();
+  drawEggs();
+  for (const r of ripples) drawRipple(r);
+
+  // 4) birds (sorted so birds lower on screen are drawn in front)
+  for (const b of birds.filter(x => !x.inCoop).sort((a, c) => a.y - c.y)) {
+    b.isChick ? drawChick(b) : drawHen(b);
+    if (b.shockTime > 0 && (frameCount >> 2 & 1)) {            // yellow blink while stunned
+      ctx.globalAlpha = .4;
+      drawDisc(ctx, b.x, b.y, b.isChick ? 4 : 9, '#fff4a0');
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  for (const b of birds) if (b.state === 'crow' && !b.inCoop) drawCrowEffect(b);
+  drawHawk();
+
+  // 5) bush tops + the coop (in front of birds)
+  ctx.drawImage(canopyCanvas, 0, 0);
+
+
+  // 6) butterflies (they fade away at night)
+  if (nightAmount < .5) {
+    ctx.globalAlpha = clamp(1 - nightAmount * 2, 0, 1);
+    for (const f of butterflies) drawButterfly(f);
+    ctx.globalAlpha = 1;
+  }
+
+  // 7) sparks
+  for (const s of sparks) {
+    const alpha = Math.min(1, s.life * 2);
+    if (s.heart) {                                                 // little pink heart
+      const hx = s.x | 0, hy = s.y | 0;
+      ctx.fillStyle = `rgba(255,110,160,${alpha})`;
+      ctx.fillRect(hx - 2, hy - 2, 2, 1); ctx.fillRect(hx + 1, hy - 2, 2, 1);
+      ctx.fillRect(hx - 2, hy - 1, 5, 1); ctx.fillRect(hx - 1, hy, 3, 1); ctx.fillRect(hx, hy + 1, 1, 1);
+    } else if (s.rgb) {                                            // colored specks (egg shell, dust, gold)
+      ctx.fillStyle = `rgba(${s.rgb},${alpha})`;
+      ctx.fillRect(s.x | 0, s.y | 0, s.size || 2, s.size || 2);
+    } else {
+      ctx.fillStyle = s.electric ? `rgba(255,235,80,${Math.min(1, s.life * 2)})` : `rgba(255,255,255,${Math.min(1, s.life)})`;
+      ctx.fillRect(s.x | 0, s.y | 0, s.electric ? 1 : 2, s.electric ? 2 : 1);
+    }
+  }
+
+  // 8) sunlight glow from the top-left corner
+  const glow = ctx.createRadialGradient(60, 0, 10, 60, 0, 380);
+  glow.addColorStop(0, `rgba(255,248,200,${.28 * (1 - rainAmount) * (1 - nightAmount)})`);
+  glow.addColorStop(1, 'rgba(255,248,200,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // 9) rain: grey tint + falling drops
+  if (rainAmount > .01) {
+    ctx.fillStyle = `rgba(50,75,95,${.3 * rainAmount})`;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.fillStyle = `rgba(190,215,240,${.7 * rainAmount})`;
+    for (const d of rainDrops) ctx.fillRect(d.x | 0, d.y | 0, 1, 3);
+  }
+
+  // 9b) day and night
+  drawNight();
+
+  // 10) lightning bolts + white flash
+  frameCount++;
+  for (const bolt of bolts) {
+    const alpha = Math.min(1, bolt.life * 4);
+    for (let i = 1; i < bolt.points.length; i++) {
+      const [x1, y1] = bolt.points[i - 1], [x2, y2] = bolt.points[i];
+      const n = Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1)));
+      for (let j = 0; j <= n; j++) {
+        const x = Math.round(x1 + (x2 - x1) * j / n), y = Math.round(y1 + (y2 - y1) * j / n);
+        ctx.fillStyle = `rgba(255,240,120,${alpha * .5})`; ctx.fillRect(x - 2, y - 1, 5, 3);
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;      ctx.fillRect(x - 1, y, 2, 1);
+      }
+    }
+  }
+  if (flashAmount > 0) {
+    ctx.fillStyle = `rgba(255,255,240,${flashAmount * .6})`;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  }
+}
+
+
+/* ==========================================================================
+   11. PLAYER ACTIONS  –  tap, thunder, scatter
+   ========================================================================== */
+
+// Lightning strike at (x, y): zigzag bolt, flash, stun nearby birds, scare farther ones
+function strikeThunder(x, y) {
+  const points = [[x + (liveRandom() - .5) * 20, 0]];
+  let currentY = 0;
+  while (currentY < y - 6) {
+    currentY = Math.min(y, currentY + 8 + liveRandom() * 10);
+    points.push([currentY >= y ? x : x + (liveRandom() - .5) * 26, currentY]);
+  }
+  points.push([x, y]);
+
+  bolts.push({ points, life: .45 });
+  flashAmount = 1;
+  ripples.push({ x, y, age: 0, color: '255,240,120', duration: .6, size: 60 });
+  for (let i = 0; i < 14; i++) {
+    sparks.push({ x, y, vx: (liveRandom() - .5) * 120, vy: (liveRandom() - .5) * 120, life: .4 + liveRandom() * .3, electric: 1 });
+  }
+
+  Sound.thunder();
+  for (const b of birds) {
+    if (b.inCoop || b.held || b.state === 'climb' || b.state === 'descend') continue;     // asleep / on the ramp: not affected
+    const d = Math.hypot(b.x - x, b.y - y);
+    if (d < SETTINGS.thunderShockRadius) {
+      b.shockTime = 2.5 + liveRandom() * 1.5;
+      clearTarget(b);
+      b.scareDelay = 0; b.fleeTime = 0; b.speed = 0;
+      b.panicTime = 0; b.wingOpen = 0;       // stunned birds stop flapping
+    } else if (d < SETTINGS.thunderScareRadius) {
+      b.scareX = x; b.scareY = y;
+      b.scareDelay = d / 400 + liveRandom() * .1;
+      b.fleeTime = 0;
+    }
+  }
+}
+
+// TAP / CLICK on the yard
+//   - tap an empty spot  = scare the flock (they run + flap), or call thunder in rain mode
+//   - tap a chicken      = pet it (hearts!)
+//   - hold or drag a chicken = pick it up and carry it somewhere else
+const toCanvas = e => {
+  const box = canvas.getBoundingClientRect();
+  return { x: (e.clientX - box.left) / box.width * WIDTH, y: (e.clientY - box.top) / box.height * HEIGHT };
+};
+
+// Which chicken is under this spot? (the closest one, or null)
+function birdAt(x, y) {
+  let best = null, bestDistance = 1e9;
+  for (const b of birds) {
+    if (b.inCoop) continue;
+    const reach = b.isChick ? 9 : 12 * b.size + 2, d = Math.hypot(b.x - x, b.y - y);
+    if (d < reach && d < bestDistance) { best = b; bestDistance = d; }
+  }
+  return best;
+}
+
+let drag = null;     // { bird, x, y, startX, startY, time, carrying } while a finger is on a chicken
+
+// Sunny mode: a tap scares every chicken inside the radius.
+// Closer birds react first, then they run + flap wings (see startPanicRun)
+function tapScare(x, y) {
+  ripples.push({ x, y, age: 0, color: '240,225,190', duration: .9 });
+  Sound.whoosh();
+  for (const b of birds) {
+    if (b.inCoop || b.held) continue;
+    const d = Math.hypot(b.x - x, b.y - y);
+    if (d < SETTINGS.tapScareRadius) {
+      b.scareX = x; b.scareY = y;
+      b.scareDelay = d / SETTINGS.tapReactionSpeed + liveRandom() * .12;
+      b.fleeTime = 0;
+    }
+  }
+}
+
+function pickUp(b) {
+  if (!drag) return;
+  drag.carrying = true;
+  b.held = true;
+  endFight(b); clearTarget(b);
+  b.panicTime = 0; b.wingOpen = 0; b.scareDelay = 0; b.fleeTime = 0;
+  b.state = 'idle'; b.speed = 0;
+  Sound.squeak();
+}
+
+function dropBird(b) {
+  b.held = false;
+  b.jitterX = b.jitterY = 0;
+  b.state = 'idle'; b.stateTimer = 1; b.speed = 0; b.foodCooldown = 1.5;
+  for (const [ox, oy, r] of OBSTACLES) {                       // if dropped inside the coop / trough, push out
+    const dx = b.x - ox, dy = b.y - oy, d = Math.hypot(dx, dy) || 1;
+    if (d < r) { b.x = ox + dx / d * r; b.y = oy + dy / d * r; }
+  }
+  for (let i = 0; i < 5; i++) sparks.push({ x: b.x, y: b.y + 2, vx: (liveRandom() - .5) * 40, vy: -5 - liveRandom() * 12, life: .5, rgb: '216,185,140', size: 2 });
+}
+
+function petBird(b) {
+  clearTarget(b);
+  b.state = 'idle'; b.stateTimer = 1.6; b.speed = 0; b.panicTime = 0;
+  for (let i = 0; i < 3; i++) sparks.push({ x: b.x + (liveRandom() - .5) * 8, y: b.y - 6, vx: (liveRandom() - .5) * 12, vy: -16 - liveRandom() * 8, life: 1.2, heart: 1 });
+  Sound.squeak();
+  if (b.isRooster) { b.crowCooldown = 0; b.stateTimer = .3; }   // a petted rooster crows proudly
+}
+
+canvas.addEventListener('pointerdown', e => {
+  Sound.unlock();
+  const p = toCanvas(e);
+  byId('hint').style.opacity = 0;
+
+  if (isRaining) { strikeThunder(p.x, p.y); return; }          // in rain mode a tap = lightning
+
+  const bird = birdAt(p.x, p.y);
+  if (bird && !bird.held) {
+    drag = { bird, x: p.x, y: p.y, startX: p.x, startY: p.y, time: performance.now(), carrying: false };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    return;
+  }
+  tapScare(p.x, p.y);
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = toCanvas(e);
+  drag.x = p.x; drag.y = p.y;
+  if (!drag.carrying && Math.hypot(p.x - drag.startX, p.y - drag.startY) > 5) pickUp(drag.bird);
+});
+const endDrag = () => {
+  if (!drag) return;
+  const { bird, carrying } = drag;
+  drag = null;
+  carrying ? dropBird(bird) : petBird(bird);
+};
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+
+// Holding a finger still on a chicken for a moment also picks it up (called every frame)
+function updateDrag() {
+  if (drag && !drag.carrying && performance.now() - drag.time > 260) pickUp(drag.bird);
+}
+
+// SCATTER button: everyone bolts away from the middle of the flock
+function scatterFlock() {
+  const active = birds.filter(b => !b.inCoop && !b.held && b.state !== 'climb' && b.state !== 'descend');
+  if (!active.length) return;
+  let centerX = 0, centerY = 0;
+  for (const b of active) { centerX += b.x; centerY += b.y; }
+  centerX /= active.length; centerY /= active.length;
+
+  for (const b of active) {
+    startPanicRun(b, centerX, centerY, false);        // Scatter = run only, NO wing flap
+    b.angle = Math.atan2(b.y - centerY, b.x - centerX) + (liveRandom() - .5);
+    b.speed = b.cruiseSpeed * 3;
+    if (!b.isChick) for (let i = 0; i < 4; i++) {                 // flying feathers
+      sparks.push({ x: b.x, y: b.y, vx: (liveRandom() - .5) * 60, vy: (liveRandom() - .5) * 60, life: 1 + liveRandom() });
+    }
+  }
+  ripples.push({ x: centerX, y: centerY, age: 0, color: '240,225,190', duration: 1.4 });
+  Sound.whoosh();
+}
+
+
+/* ==========================================================================
+   12. BUTTONS & KEYBOARD
+   ========================================================================== */
+
+// Little message at the top of the screen
+let hintTimer = 0;
+function showHint(text, seconds) {
+  const hint = byId('hint');
+  hint.textContent = text;
+  hint.style.opacity = 1;
+  clearTimeout(hintTimer);
+  if (seconds) hintTimer = setTimeout(() => { hint.style.opacity = 0; }, seconds * 1000);
+}
+const DEFAULT_HINT = 'Tap the yard to scare the flock. Tap a chicken to pet it, drag to carry it';
+
+// Remember the flock and settings for next time
+function saveNow() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify({ hens: hens.length, roosters: roosters.length, chicks: chickCount(), sound: Sound.isOn, timeMode })); } catch (e) {}
+}
+
+byId('sc').onclick = scatterFlock;
+byId('fd').onclick = feedChickens;
+byId('hk').onclick = () => { Sound.unlock(); startHawk(); };
+
+// Counters: − / + for hens, roosters and chicks (the egg count is just shown)
+function updateCounts() {
+  byId('hen-count').textContent = hens.length;
+  byId('rooster-count').textContent = roosters.length;
+  byId('chick-count').textContent = chickCount();
+  byId('egg-count').textContent = eggs.length;
+  saveNow();
+}
+byId('hen-more').onclick     = () => { if (hens.length < SETTINGS.maxHens) addHen(); updateCounts(); };
+byId('hen-less').onclick     = () => { removeLast(hens); updateCounts(); };
+byId('rooster-more').onclick = () => { if (roosters.length < SETTINGS.maxRoosters) addRooster(); updateCounts(); };
+byId('rooster-less').onclick = () => { removeLast(roosters); updateCounts(); };
+byId('chick-more').onclick   = () => { if (chickCount() < SETTINGS.maxChicks) addChick(); updateCounts(); };
+byId('chick-less').onclick   = () => { removeChick(); updateCounts(); };
+
+byId('rn').onclick = e => {                                        // Sunny / Rain
+  isRaining = !isRaining;
+  e.target.textContent = isRaining ? 'Rain' : 'Sunny';
+  showHint(isRaining ? 'Tap to call thunder. It paralyzes nearby chickens' : DEFAULT_HINT);
+};
+
+// Time of day: Auto (the clock runs) -> Day (always day) -> Night (always night)
+const TIME_LABELS = { auto: 'Time: Auto', day: 'Time: Day', night: 'Time: Night' };
+byId('tm').onclick = () => {
+  timeMode = timeMode === 'auto' ? 'day' : timeMode === 'day' ? 'night' : 'auto';
+  refreshButtons(); saveNow();
+};
+
+byId('snd').onclick = () => {
+  Sound.unlock(); Sound.toggle();
+  refreshButtons(); saveNow();
+  Sound.pip();
+};
+
+function togglePause() { paused = !paused; refreshButtons(); }
+byId('ps').onclick = togglePause;
+
+// Photo: saves a big picture of the yard (4x size, sharp pixels)
+function takePhoto() {
+  try {
+    draw();
+    const out = document.createElement('canvas');
+    out.width = WIDTH * 4; out.height = HEIGHT * 4;
+    const c = out.getContext('2d');
+    c.imageSmoothingEnabled = false;
+    c.drawImage(canvas, 0, 0, out.width, out.height);
+    out.toBlob(blob => {
+      if (!blob) return;
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = 'hiyoko-yard.png';
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(link.href), 3000);
+    });
+    flashAmount = .6;
+    Sound.click();
+    showHint('Photo saved: hiyoko-yard.png', 2.5);
+  } catch (e) {
+    showHint('Could not save the photo here', 2.5);
+  }
+}
+byId('cam').onclick = takePhoto;
+
+const toggleUI = () => byId('w').classList.toggle('off');
+byId('hd').onclick = toggleUI;
+
+// Keep button labels in sync
+function refreshButtons() {
+  byId('tm').textContent = TIME_LABELS[timeMode];
+  byId('snd').textContent = Sound.isOn ? 'Sound: On' : 'Sound: Off';
+  byId('ps').firstChild.textContent = paused ? 'Resume' : 'Pause';
+}
+refreshButtons();
+updateCounts();
+
+addEventListener('keydown', e => {
+  Sound.unlock();
+  if (e.code === 'Space')                  { e.preventDefault(); scatterFlock(); }
+  else if (e.key === 'h' || e.key === 'H') toggleUI();
+  else if (e.key === 'f' || e.key === 'F') feedChickens();
+  else if (e.key === 'k' || e.key === 'K') startHawk();
+  else if (e.key === 'p' || e.key === 'P') togglePause();
+  else if (e.key === 'c' || e.key === 'C') takePhoto();
+});
+
+
+/* ==========================================================================
+   13. MAIN LOOP  –  physics at a fixed 60 steps/second, drawing every frame
+   ========================================================================== */
+let lastTime = performance.now(), leftoverTime = 0;
+(function loop(now) {
+  leftoverTime += Math.min(.1, (now - lastTime) / 1000);
+  lastTime = now;
+  updateDrag();
+  while (leftoverTime >= 1 / 60) { step(1 / 60); leftoverTime -= 1 / 60; }
+  draw();
+  requestAnimationFrame(loop);
+})(lastTime);
+</script>
+</body>
+</html>
